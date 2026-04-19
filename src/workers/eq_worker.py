@@ -43,12 +43,13 @@ from src.core.layer_config import (
     parse_layer_list_string,
     parse_queue_entry_layers,
 )
-from src.workers.batch_control import adaptive_batch_execute
 from src.workers.model_utils import (
+    build_teacher_forced_inputs,
     is_moe_model,
     load_model_and_tokenizer,
     parse_device_map_arg,
     parse_max_memory_json,
+    score_teacher_forced_inputs,
     strip_thinking,
 )
 from src.workers.shared_queue import SharedWorkQueue, format_eta
@@ -62,14 +63,50 @@ PADDING_MODE_INPROMPT_SPACE = "inprompt_space"
 
 
 def generate_eq_messages(prompt: str, *, use_no_think_prefix: bool = True) -> list[dict]:
-    """Generate chat messages for EQ-Bench question.
-
-    Note: The EQ-Bench prompts already contain detailed format instructions
-    including "First pass scores:" and "Revised scores:" format.
-    We just pass the prompt directly without adding extra system prompts.
-    """
+    """Generate chat messages for EQ-Bench question."""
     prompt_text = f"/no_think {prompt}" if use_no_think_prefix else prompt
     return [{"role": "user", "content": prompt_text}]
+
+
+def serialize_eq_first_pass_target(reference: dict) -> str:
+    """Build a canonical first-pass EQ target using fullscale integer scores."""
+    lines = ["First pass scores:"]
+    for idx in range(1, 5):
+        emotion = reference[f"emotion{idx}"]
+        score = int(reference[f"emotion{idx}_score"])
+        lines.append(f"{emotion}: {score}")
+    return "\n".join(lines)
+
+
+def build_eq_first_pass_target(reference: dict) -> tuple[str, list[tuple[int, int]]]:
+    """Build the canonical EQ first-pass target and char spans for numeric scores only."""
+    lines = ["First pass scores:"]
+    spans: list[tuple[int, int]] = []
+    text = "First pass scores:"
+    for idx in range(1, 5):
+        emotion = reference[f"emotion{idx}"]
+        score_text = str(int(reference[f"emotion{idx}_score"]))
+        prefix = f"\n{emotion}: "
+        text += prefix
+        start = len(text)
+        text += score_text
+        end = len(text)
+        spans.append((start, end))
+        lines.append(f"{emotion}: {score_text}")
+    return text, spans
+
+
+def build_eq_prompt_target(tokenizer, prompt: str, reference_fullscale: dict, *, use_no_think_prefix: bool = True) -> tuple[str, str, list[tuple[int, int]]]:
+    """Render the canonical EQ prompt and first-pass target for proxy scoring."""
+    messages = generate_eq_messages(prompt, use_no_think_prefix=use_no_think_prefix)
+    prompt_text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
+    target_text, target_char_spans = build_eq_first_pass_target(reference_fullscale)
+    return prompt_text, target_text, target_char_spans
 
 
 def extract_scores_from_section(text: str) -> Optional[list[float]]:
@@ -260,6 +297,97 @@ def pretokenize_eq_dataset(dataset: dict, tokenizer, device, *, use_no_think_pre
 
     print(f"Pre-tokenized {len(tokenized)} questions")
     return tokenized
+
+
+def pretokenize_eq_teacher_forced_dataset(dataset: dict, tokenizer, device, *, use_no_think_prefix: bool = True) -> dict:
+    """Pre-tokenize EQ prompt+target pairs once for teacher-forced proxy scoring."""
+    print("Pre-tokenizing teacher-forced EQ dataset...")
+    tokenized = {}
+
+    for qid, sample in tqdm(dataset.items(), desc="Tokenizing teacher-forced"):
+        prompt_text, target_text, target_char_spans = build_eq_prompt_target(
+            tokenizer,
+            sample["prompt"],
+            sample["reference_answer_fullscale"],
+            use_no_think_prefix=use_no_think_prefix,
+        )
+        inputs = build_teacher_forced_inputs(
+            tokenizer,
+            prompt_text=prompt_text,
+            target_text=target_text,
+            target_char_spans=target_char_spans,
+            device=device,
+        )
+        tokenized[qid] = {
+            "input_ids": inputs.input_ids,
+            "attention_mask": inputs.attention_mask,
+            "prompt_length": inputs.prompt_length,
+            "target_length": inputs.target_length,
+            "target_mask": inputs.target_mask,
+            "target_text": target_text,
+        }
+
+    print(f"Pre-tokenized {len(tokenized)} teacher-forced EQ questions")
+    return tokenized
+
+
+def run_eq_teacher_forced_proxy(
+    model,
+    teacher_forced_dataset: dict,
+    *,
+    reduction: str = "mean",
+    save_responses: bool = True,
+):
+    """Score EQ benchmark examples with teacher-forced target logprobs."""
+    responses = [] if save_responses else None
+    scores = []
+    mean_logprobs = []
+    sum_logprobs = []
+    total_target_tokens = 0
+
+    for qid, cached in teacher_forced_dataset.items():
+        result = score_teacher_forced_inputs(
+            model=model,
+            input_ids=cached["input_ids"],
+            attention_mask=cached["attention_mask"],
+            prompt_length=int(cached["prompt_length"]),
+            target_mask=cached.get("target_mask"),
+            reduction=reduction,
+        )
+        scores.append(float(result["score"]))
+        mean_logprobs.append(float(result["mean_logprob"]))
+        sum_logprobs.append(float(result["sum_logprob"]))
+        total_target_tokens += int(result["target_token_count"])
+
+        if save_responses:
+            responses.append(
+                {
+                    "qid": qid,
+                    "score": float(result["score"]),
+                    "mean_logprob": float(result["mean_logprob"]),
+                    "sum_logprob": float(result["sum_logprob"]),
+                    "target_token_count": int(result["target_token_count"]),
+                    "scored_token_count": int(result["scored_token_count"]),
+                    "target_text": cached["target_text"],
+                }
+            )
+
+    avg_score = sum(scores) / len(scores) if scores else 0.0
+    avg_mean_logprob = sum(mean_logprobs) / len(mean_logprobs) if mean_logprobs else 0.0
+    total_sum_logprob = sum(sum_logprobs)
+
+    result = {
+        "score": float(avg_score),
+        "mean_logprob": float(avg_mean_logprob),
+        "sum_logprob": float(total_sum_logprob),
+        "target_token_count": int(total_target_tokens),
+        "scored_token_count": int(sum(int(r["scored_token_count"]) for r in responses)) if save_responses else int(total_target_tokens),
+        "scoring_mode": "teacher_forced_proxy",
+        "reduction": reduction,
+    }
+    if save_responses:
+        result["responses"] = responses
+    return result
 
 
 def run_eq_test(
@@ -519,6 +647,8 @@ def main():
                         help="max_new_tokens for EQ preflight probe")
     parser.add_argument("--preflight-min-nonzero-conf-rate", type=float, default=0.5,
                         help="Minimum non-zero confidence extraction rate in preflight (0..1)")
+    parser.add_argument("--proxy-reduction", type=str, choices=["mean", "sum"], default="mean",
+                        help="Reduction used for teacher-forced proxy scoring")
 
     # Direct layer specification (single-config mode, bypasses queue)
     parser.add_argument("--layer-list", type=str, default=None,
@@ -569,6 +699,7 @@ def main():
     print(f"Dataset: {args.dataset_path}")
     print(f"Batch size: {args.batch_size}")
     print(f"EQ max_new: {args.max_new}")
+    print(f"Teacher-forced proxy: enabled (reduction={args.proxy_reduction})")
     print(f"Padding mode: {args.padding_mode}")
     print(f"Adaptive retry: {args.adaptive_batch_retry} (min={args.min_batch_size}, max_retries={args.max_retries_per_phase})")
     print(
@@ -639,62 +770,25 @@ def main():
     num_layers = int(load_meta["num_layers"])
     print(f"Model has {num_layers} text layers")
 
-    # Pre-tokenize dataset
-    tokenized_dataset = pretokenize_eq_dataset(
+    teacher_forced_dataset = pretokenize_eq_teacher_forced_dataset(
         dataset,
         tokenizer,
         model.device,
         use_no_think_prefix=args.use_no_think_prefix,
     )
-    if args.prompt_pad_id is not None:
-        prompt_pad_id = int(args.prompt_pad_id)
-    else:
-        try:
-            space_ids = tokenizer(" ", add_special_tokens=False)["input_ids"]
-            prompt_pad_id = int(space_ids[-1]) if space_ids else int(tokenizer.pad_token_id or tokenizer.eos_token_id)
-        except Exception:
-            prompt_pad_id = int(tokenizer.pad_token_id or tokenizer.eos_token_id)
 
     if not args.skip_preflight:
-        preflight = run_eq_preflight(
-            model,
-            tokenized_dataset,
-            tokenizer,
-            samples=args.preflight_samples,
-            batch_size=args.batch_size,
-            max_new_tokens=args.preflight_max_new,
-            padding_mode=args.padding_mode,
-            prompt_pad_id=prompt_pad_id,
-            min_nonzero_conf_rate=args.preflight_min_nonzero_conf_rate,
-        )
-        print(
-            "Preflight passed: "
-            f"samples={int(preflight['samples'])}, "
-            f"score={preflight['score']:.4f}, "
-            f"nonzero_conf_rate={preflight['nonzero_conf_rate']:.2%}"
-        )
+        print("Preflight skipped in proxy branch.")
 
-    def run_eq_with_retry(run_model):
-        """Run EQ eval with optional adaptive batch fallback."""
-        execution = adaptive_batch_execute(
-            lambda batch: run_eq_test(
-                run_model,
-                tokenized_dataset,
-                tokenizer,
-                batch_size=batch,
-                max_new_tokens=args.max_new,
-                save_responses=True,
-                padding_mode=args.padding_mode,
-                prompt_pad_id=prompt_pad_id,
-            ),
-            initial_batch_size=args.batch_size,
-            min_batch_size=args.min_batch_size,
-            max_retries=args.max_retries_per_phase,
-            enabled=args.adaptive_batch_retry,
-            phase_name="eq",
-            on_retry=lambda msg: print(f"[{args.worker_id}] {msg}"),
+    def run_eq_proxy(run_model):
+        """Run teacher-forced proxy scoring for EQ."""
+        result = run_eq_teacher_forced_proxy(
+            run_model,
+            teacher_forced_dataset,
+            reduction=args.proxy_reduction,
+            save_responses=True,
         )
-        return execution.result, execution.batch_size, execution.retries
+        return result, 1, 0
 
     # Single-config mode: direct layer list or blocks specification
     if custom_mode:
@@ -773,11 +867,11 @@ def main():
 
             if layer_indices == list(range(num_layers)):
                 print("Running baseline (original model)...")
-                result, effective_batch, retries = run_eq_with_retry(model)
+                result, effective_batch, retries = run_eq_proxy(model)
             else:
                 print("Building duplicated model...")
                 dup_model = build_duplicated_model(model, layer_indices)
-                result, effective_batch, retries = run_eq_with_retry(dup_model)
+                result, effective_batch, retries = run_eq_proxy(dup_model)
                 del dup_model
                 torch.cuda.empty_cache()
 
@@ -785,7 +879,7 @@ def main():
             score = result['score']
             print(
                 f"Result: score={score:.4f} ({elapsed:.1f}s, "
-                f"batch={effective_batch}, retries={retries})"
+                f"mean_logprob={result['mean_logprob']:.4f}, target_tokens={result['target_token_count']})"
             )
 
             # Save result incrementally
@@ -833,10 +927,10 @@ def main():
         config_start_time = time.time()
 
         if is_baseline_layers(layer_indices, num_layers):
-            result, effective_batch, retries = run_eq_with_retry(model)
+            result, effective_batch, retries = run_eq_proxy(model)
         else:
             dup_model = build_duplicated_model(model, layer_indices)
-            result, effective_batch, retries = run_eq_with_retry(dup_model)
+            result, effective_batch, retries = run_eq_proxy(dup_model)
             del dup_model
             torch.cuda.empty_cache()
 
@@ -859,7 +953,8 @@ def main():
             eta_str = "N/A"
 
         print(f"[{args.worker_id}] Config {config_idx} {config_spec} ({layer_spec_string(layer_indices)}): score={score:.4f} "
-              f"({config_time:.1f}s, batch={effective_batch}, retries={retries}) | "
+              f"({config_time:.1f}s, mean_logprob={result['mean_logprob']:.4f}, "
+              f"target_tokens={result['target_token_count']}) | "
               f"Queue: {remaining} left | Rate: {rate:.2f}/s | ETA: {eta_str}")
 
     total_time = time.time() - start_time

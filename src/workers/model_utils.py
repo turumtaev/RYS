@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 import os
 import re
@@ -293,3 +294,199 @@ def strip_thinking(text: str) -> str:
     result = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
     result = re.sub(r"<think>.*$", "", result, flags=re.DOTALL)
     return result.strip()
+
+
+@dataclass(frozen=True)
+class TeacherForcedInputs:
+    input_ids: torch.Tensor
+    attention_mask: torch.Tensor
+    prompt_length: int
+    target_length: int
+    target_mask: torch.Tensor | None = None
+
+
+def _move_tensor_batch(
+    batch: dict[str, torch.Tensor],
+    device: torch.device | str | None,
+) -> dict[str, torch.Tensor]:
+    if device is None:
+        return batch
+    return {k: v.to(device) for k, v in batch.items()}
+
+
+def build_teacher_forced_inputs(
+    tokenizer: Any,
+    *,
+    prompt_text: str,
+    target_text: str,
+    target_char_spans: list[tuple[int, int]] | None = None,
+    device: torch.device | str | None = None,
+    add_special_tokens: bool = True,
+) -> TeacherForcedInputs:
+    """Tokenize a prompt/target pair for teacher-forced scoring."""
+    prompt_batch = tokenizer(prompt_text, return_tensors="pt", add_special_tokens=add_special_tokens)
+    full_tokenizer_kwargs: dict[str, Any] = {
+        "return_tensors": "pt",
+        "add_special_tokens": add_special_tokens,
+    }
+    need_offsets = bool(target_char_spans)
+    if need_offsets:
+        full_tokenizer_kwargs["return_offsets_mapping"] = True
+    full_batch = tokenizer(prompt_text + target_text, **full_tokenizer_kwargs)
+
+    prompt_ids = prompt_batch["input_ids"]
+    full_ids = full_batch["input_ids"]
+    prompt_len = int(prompt_ids.shape[1])
+    full_len = int(full_ids.shape[1])
+    if full_len <= prompt_len:
+        raise ValueError("Target text produced no additional tokens.")
+    if not torch.equal(full_ids[:, :prompt_len], prompt_ids):
+        raise ValueError(
+            "Prompt tokenization is not a prefix of prompt+target tokenization. "
+            "Use a canonical target serialization that preserves the tokenizer boundary."
+        )
+
+    target_mask = None
+    if target_char_spans:
+        if "offset_mapping" not in full_batch:
+            raise ValueError(
+                "Masked teacher-forced scoring requires tokenizer offset mappings. "
+                "Use a fast tokenizer or disable target masking."
+            )
+
+        prompt_char_len = len(prompt_text)
+        target_offsets = full_batch["offset_mapping"][:, prompt_len:, :]
+        mask_rows: list[list[bool]] = []
+        for row in target_offsets.tolist():
+            row_mask: list[bool] = []
+            for start, end in row:
+                rel_start = max(0, int(start) - prompt_char_len)
+                rel_end = max(0, int(end) - prompt_char_len)
+                is_scored = False
+                if rel_end > rel_start:
+                    for span_start, span_end in target_char_spans:
+                        if rel_start < span_end and rel_end > span_start:
+                            is_scored = True
+                            break
+                row_mask.append(is_scored)
+            mask_rows.append(row_mask)
+        target_mask = torch.tensor(mask_rows, dtype=torch.bool)
+
+    full_batch = _move_tensor_batch(
+        {k: v for k, v in full_batch.items() if k != "offset_mapping"},
+        device,
+    )
+    if target_mask is not None and device is not None:
+        target_mask = target_mask.to(device)
+    return TeacherForcedInputs(
+        input_ids=full_batch["input_ids"],
+        attention_mask=full_batch["attention_mask"],
+        prompt_length=prompt_len,
+        target_length=full_len - prompt_len,
+        target_mask=target_mask,
+    )
+
+
+def gather_target_token_logprobs(
+    *,
+    logits: torch.Tensor,
+    input_ids: torch.Tensor,
+    prompt_length: int,
+) -> torch.Tensor:
+    """Extract token logprobs for the target suffix of a prompt+target sequence."""
+    if input_ids.ndim != 2 or logits.ndim != 3:
+        raise ValueError("Expected input_ids shape [batch, seq] and logits shape [batch, seq, vocab].")
+    if input_ids.shape[0] != logits.shape[0] or input_ids.shape[1] != logits.shape[1]:
+        raise ValueError("Input/logit shape mismatch.")
+    if prompt_length <= 0 or prompt_length >= input_ids.shape[1]:
+        raise ValueError("prompt_length must be in [1, seq_len - 1].")
+
+    target_positions = torch.arange(prompt_length, input_ids.shape[1], device=input_ids.device)
+    next_token_logits = logits[:, target_positions - 1, :]
+    target_token_ids = input_ids[:, target_positions]
+    log_probs = torch.log_softmax(next_token_logits, dim=-1)
+    return log_probs.gather(-1, target_token_ids.unsqueeze(-1)).squeeze(-1)
+
+
+def reduce_logprobs(
+    token_logprobs: torch.Tensor,
+    reduction: str = "mean",
+    mask: torch.Tensor | None = None,
+) -> float:
+    """Reduce token-level logprobs to a scalar score."""
+    if mask is not None:
+        if mask.shape != token_logprobs.shape:
+            raise ValueError("Mask shape must match token_logprobs shape.")
+        token_logprobs = token_logprobs.masked_select(mask)
+    if token_logprobs.numel() == 0:
+        raise ValueError("Cannot reduce an empty token logprob tensor.")
+    if reduction == "mean":
+        return float(token_logprobs.mean().item())
+    if reduction == "sum":
+        return float(token_logprobs.sum().item())
+    raise ValueError(f"Unsupported reduction: {reduction!r}")
+
+
+def score_teacher_forced_inputs(
+    *,
+    model: Any,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    prompt_length: int,
+    target_mask: torch.Tensor | None = None,
+    reduction: str = "mean",
+) -> dict[str, Any]:
+    """Teacher-force a pretokenized prompt/target pair."""
+    with torch.no_grad():
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+        )
+
+    token_logprobs = gather_target_token_logprobs(
+        logits=outputs.logits,
+        input_ids=input_ids,
+        prompt_length=prompt_length,
+    )
+
+    return {
+        "score": reduce_logprobs(token_logprobs, reduction=reduction, mask=target_mask),
+        "sum_logprob": float(token_logprobs.sum().item()),
+        "mean_logprob": float(token_logprobs.mean().item()),
+        "target_token_count": int(token_logprobs.numel()),
+        "scored_token_count": int(target_mask.sum().item()) if target_mask is not None else int(token_logprobs.numel()),
+    }
+
+
+def score_prompt_target(
+    *,
+    model: Any,
+    tokenizer: Any,
+    prompt_text: str,
+    target_text: str,
+    target_char_spans: list[tuple[int, int]] | None = None,
+    device: torch.device | str | None = None,
+    add_special_tokens: bool = True,
+    reduction: str = "mean",
+) -> dict[str, Any]:
+    """Teacher-force a canonical target and return token-level logprob metrics."""
+    tf_inputs = build_teacher_forced_inputs(
+        tokenizer,
+        prompt_text=prompt_text,
+        target_text=target_text,
+        target_char_spans=target_char_spans,
+        device=device,
+        add_special_tokens=add_special_tokens,
+    )
+    result = score_teacher_forced_inputs(
+        model=model,
+        input_ids=tf_inputs.input_ids,
+        attention_mask=tf_inputs.attention_mask,
+        prompt_length=tf_inputs.prompt_length,
+        target_mask=tf_inputs.target_mask,
+        reduction=reduction,
+    )
+    result["prompt_token_count"] = int(tf_inputs.prompt_length)
+    result["target_length"] = int(tf_inputs.target_length)
+    return result

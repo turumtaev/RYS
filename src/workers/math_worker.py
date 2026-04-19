@@ -48,12 +48,13 @@ from src.core.layer_config import (
     parse_layer_list_string,
     parse_queue_entry_layers,
 )
-from src.workers.batch_control import adaptive_batch_execute
 from src.workers.model_utils import (
+    build_teacher_forced_inputs,
     is_moe_model,
     load_model_and_tokenizer,
     parse_device_map_arg,
     parse_max_memory_json,
+    score_teacher_forced_inputs,
     strip_thinking,
 )
 from src.workers.shared_queue import SharedWorkQueue, format_eta
@@ -107,6 +108,32 @@ def generate_messages(question, *, use_no_think_prefix: bool = True):
     ]
 
 
+def serialize_math_target(answer) -> str:
+    """Convert a math answer to the canonical proxy target string."""
+    try:
+        return str(int(answer))
+    except (TypeError, ValueError, OverflowError):
+        return str(answer).strip()
+
+
+def build_math_target(answer) -> tuple[str, list[tuple[int, int]]]:
+    """Build the canonical math target and the spans to score."""
+    target_text = serialize_math_target(answer)
+    return target_text, [(0, len(target_text))]
+
+
+def build_math_prompt_target(tokenizer, question: str, answer, *, use_no_think_prefix: bool = True) -> tuple[str, str, list[tuple[int, int]]]:
+    """Render the canonical math prompt and target for teacher-forced proxy scoring."""
+    messages = generate_messages(question, use_no_think_prefix=use_no_think_prefix)
+    prompt = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
+    target_text, target_char_spans = build_math_target(answer)
+    return prompt, target_text, target_char_spans
+
 def extract_integers(text):
     """Extract all integers from generated text."""
     split_parts = re.split(r'\D+', text)
@@ -133,6 +160,97 @@ def pretokenize_dataset(dataset, tokenizer, device, *, use_no_think_prefix: bool
 
     print(f"Pre-tokenized {len(tokenized)} questions")
     return tokenized
+
+
+def pretokenize_teacher_forced_dataset(dataset, tokenizer, device, *, use_no_think_prefix: bool = True) -> dict:
+    """Pre-tokenize prompt+target pairs once for teacher-forced proxy scoring."""
+    print("Pre-tokenizing teacher-forced math dataset...")
+    tokenized = {}
+
+    for qid, sample in tqdm(dataset.items(), desc="Tokenizing teacher-forced"):
+        prompt_text, target_text, target_char_spans = build_math_prompt_target(
+            tokenizer,
+            sample["question"],
+            sample["answer"],
+            use_no_think_prefix=use_no_think_prefix,
+        )
+        inputs = build_teacher_forced_inputs(
+            tokenizer,
+            prompt_text=prompt_text,
+            target_text=target_text,
+            target_char_spans=target_char_spans,
+            device=device,
+        )
+        tokenized[qid] = {
+            "input_ids": inputs.input_ids,
+            "attention_mask": inputs.attention_mask,
+            "prompt_length": inputs.prompt_length,
+            "target_length": inputs.target_length,
+            "target_mask": inputs.target_mask,
+            "target_text": target_text,
+        }
+
+    print(f"Pre-tokenized {len(tokenized)} teacher-forced math questions")
+    return tokenized
+
+
+def run_math_teacher_forced_proxy(
+    model,
+    teacher_forced_dataset: dict,
+    *,
+    reduction: str = "mean",
+    save_responses: bool = True,
+):
+    """Score math benchmark examples with teacher-forced target logprobs."""
+    responses = [] if save_responses else None
+    scores = []
+    mean_logprobs = []
+    sum_logprobs = []
+    total_target_tokens = 0
+
+    for qid, cached in teacher_forced_dataset.items():
+        result = score_teacher_forced_inputs(
+            model=model,
+            input_ids=cached["input_ids"],
+            attention_mask=cached["attention_mask"],
+            prompt_length=int(cached["prompt_length"]),
+            target_mask=cached.get("target_mask"),
+            reduction=reduction,
+        )
+        scores.append(float(result["score"]))
+        mean_logprobs.append(float(result["mean_logprob"]))
+        sum_logprobs.append(float(result["sum_logprob"]))
+        total_target_tokens += int(result["target_token_count"])
+
+        if save_responses:
+            responses.append(
+                {
+                    "qid": qid,
+                    "score": float(result["score"]),
+                    "mean_logprob": float(result["mean_logprob"]),
+                    "sum_logprob": float(result["sum_logprob"]),
+                    "target_token_count": int(result["target_token_count"]),
+                    "scored_token_count": int(result["scored_token_count"]),
+                    "target_text": cached["target_text"],
+                }
+            )
+
+    avg_score = sum(scores) / len(scores) if scores else 0.0
+    avg_mean_logprob = sum(mean_logprobs) / len(mean_logprobs) if mean_logprobs else 0.0
+    total_sum_logprob = sum(sum_logprobs)
+
+    result = {
+        "score": float(avg_score),
+        "mean_logprob": float(avg_mean_logprob),
+        "sum_logprob": float(total_sum_logprob),
+        "target_token_count": int(total_target_tokens),
+        "scored_token_count": int(sum(int(r["scored_token_count"]) for r in responses)) if save_responses else int(total_target_tokens),
+        "scoring_mode": "teacher_forced_proxy",
+        "reduction": reduction,
+    }
+    if save_responses:
+        result["responses"] = responses
+    return result
 
 
 def run_math_test_batched_moe(
@@ -405,6 +523,8 @@ def main():
                         help="max_new_tokens for math preflight probe")
     parser.add_argument("--preflight-min-extract-rate", type=float, default=0.5,
                         help="Minimum parseable-integer extraction rate in preflight (0..1)")
+    parser.add_argument("--proxy-reduction", type=str, choices=["mean", "sum"], default="mean",
+                        help="Reduction used for teacher-forced proxy scoring")
 
     # Direct layer specification (single-config mode, bypasses queue)
     parser.add_argument("--layer-list", type=str, default=None,
@@ -454,6 +574,7 @@ def main():
     print(f"Model: {args.model_path}")
     print(f"Batch size: {args.batch_size}")
     print(f"Math max_new: {args.max_new}")
+    print(f"Teacher-forced proxy: enabled (reduction={args.proxy_reduction})")
     print(f"Padding mode: {args.padding_mode}")
     print(f"Adaptive retry: {args.adaptive_batch_retry} (min={args.min_batch_size}, max_retries={args.max_retries_per_phase})")
     print(
@@ -523,62 +644,25 @@ def main():
     else:
         build_duplicated_model = build_model_with_layers
 
-    # Pre-tokenize dataset
-    tokenized_dataset = pretokenize_dataset(
+    teacher_forced_dataset = pretokenize_teacher_forced_dataset(
         dataset,
         tokenizer,
         model.device,
         use_no_think_prefix=args.use_no_think_prefix,
     )
-    if args.prompt_pad_id is not None:
-        prompt_pad_id = int(args.prompt_pad_id)
-    else:
-        try:
-            space_ids = tokenizer(" ", add_special_tokens=False)["input_ids"]
-            prompt_pad_id = int(space_ids[-1]) if space_ids else int(tokenizer.pad_token_id or tokenizer.eos_token_id)
-        except Exception:
-            prompt_pad_id = int(tokenizer.pad_token_id or tokenizer.eos_token_id)
 
     if not args.skip_preflight:
-        preflight = run_math_preflight(
-            model,
-            tokenized_dataset,
-            tokenizer,
-            samples=args.preflight_samples,
-            batch_size=args.batch_size,
-            max_new_tokens=args.preflight_max_new,
-            padding_mode=args.padding_mode,
-            prompt_pad_id=prompt_pad_id,
-            min_extract_rate=args.preflight_min_extract_rate,
-        )
-        print(
-            "Preflight passed: "
-            f"samples={int(preflight['samples'])}, "
-            f"score={preflight['score']:.4f}, "
-            f"extract_rate={preflight['extract_rate']:.2%}"
-        )
+        print("Preflight skipped in proxy branch.")
 
-    def run_math_with_retry(run_model):
-        """Run math eval with optional adaptive batch fallback."""
-        execution = adaptive_batch_execute(
-            lambda batch: run_math_test_batched_moe(
-                run_model,
-                tokenized_dataset,
-                tokenizer,
-                batch_size=batch,
-                max_new_tokens=args.max_new,
-                save_responses=True,
-                padding_mode=args.padding_mode,
-                prompt_pad_id=prompt_pad_id,
-            ),
-            initial_batch_size=args.batch_size,
-            min_batch_size=args.min_batch_size,
-            max_retries=args.max_retries_per_phase,
-            enabled=args.adaptive_batch_retry,
-            phase_name="math",
-            on_retry=lambda msg: print(f"[{args.worker_id}] {msg}"),
+    def run_math_proxy(run_model):
+        """Run teacher-forced proxy scoring for math."""
+        result = run_math_teacher_forced_proxy(
+            run_model,
+            teacher_forced_dataset,
+            reduction=args.proxy_reduction,
+            save_responses=True,
         )
-        return execution.result, execution.batch_size, execution.retries
+        return result, 1, 0
 
     # Single-config mode: direct layer list or blocks specification
     if args.layer_list or args.blocks or args.config_file:
@@ -657,11 +741,11 @@ def main():
 
             if layer_indices == list(range(num_layers)):
                 print("Running baseline (original model)...")
-                result, effective_batch, retries = run_math_with_retry(model)
+                result, effective_batch, retries = run_math_proxy(model)
             else:
                 print("Building duplicated model...")
                 dup_model = build_duplicated_model(model, layer_indices)
-                result, effective_batch, retries = run_math_with_retry(dup_model)
+                result, effective_batch, retries = run_math_proxy(dup_model)
                 del dup_model
                 torch.cuda.empty_cache()
 
@@ -669,7 +753,7 @@ def main():
             score = result['score']
             print(
                 f"Result: score={score:.4f} ({elapsed:.1f}s, "
-                f"batch={effective_batch}, retries={retries})"
+                f"mean_logprob={result['mean_logprob']:.4f}, target_tokens={result['target_token_count']})"
             )
 
             # Save result incrementally
@@ -720,11 +804,11 @@ def main():
 
         if is_baseline_layers(layer_indices, num_layers):
             # Baseline - use original model
-            result, effective_batch, retries = run_math_with_retry(model)
+            result, effective_batch, retries = run_math_proxy(model)
         else:
             # Build duplicated model (auto-selects MoE or dense)
             dup_model = build_duplicated_model(model, layer_indices)
-            result, effective_batch, retries = run_math_with_retry(dup_model)
+            result, effective_batch, retries = run_math_proxy(dup_model)
 
             # Explicit memory cleanup
             del dup_model
@@ -751,7 +835,8 @@ def main():
             eta_str = "N/A"
 
         print(f"[{args.worker_id}] Config {config_idx} {config_spec} ({layer_spec_string(layer_indices)}): score={score:.4f} "
-              f"({config_time:.1f}s, batch={effective_batch}, retries={retries}) | "
+              f"({config_time:.1f}s, mean_logprob={result['mean_logprob']:.4f}, "
+              f"target_tokens={result['target_token_count']}) | "
               f"Queue: {remaining} left | Rate: {rate:.2f}/s | ETA: {eta_str}")
 
     # Final summary
