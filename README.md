@@ -181,6 +181,8 @@ Notes:
 - beam search uses the Hugging Face worker path in `src/workers/`
 - seed pickles should come from an already measured single-block scan
 - state under `--work-dir` is resume-friendly
+- for small local runs on Apple Silicon, pass `--device-map mps --torch-dtype float32 --dataset-limit 4`
+- when Math and EQ share the same device map, the launcher serializes the workers instead of running them concurrently
 
 ## Surrogate Pipeline
 

@@ -61,13 +61,48 @@ def parse_device_map_arg(raw: str) -> str | dict[str, Any]:
     """
     text = str(raw).strip()
     if not text:
-        return "cuda:0"
+        text = "auto"
     if text.startswith("{") or text.startswith("["):
         parsed = json.loads(text)
         if not isinstance(parsed, (dict, list)):
             raise ValueError("device map JSON must be an object or list")
         return parsed
+    if text == "auto":
+        if torch.cuda.is_available():
+            return "auto"
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps"
+        return "cpu"
     return text
+
+
+def parse_torch_dtype_arg(
+    raw: str | None,
+    *,
+    device_map: str | dict[str, Any] | None = None,
+) -> torch.dtype:
+    """
+    Parse a torch dtype CLI argument with a practical auto mode.
+
+    Auto defaults:
+    - CPU/MPS: float32 for maximum compatibility on local dev machines
+    - CUDA/auto sharding: bfloat16 as the existing repo default
+    """
+    text = "auto" if raw is None else str(raw).strip().lower()
+    if text in {"bf16", "bfloat16"}:
+        return torch.bfloat16
+    if text in {"fp16", "float16", "half"}:
+        return torch.float16
+    if text in {"fp32", "float32", "float"}:
+        return torch.float32
+    if text != "auto":
+        raise ValueError(f"Unsupported torch dtype: {raw!r}")
+
+    if isinstance(device_map, str) and device_map in {"cpu", "mps"}:
+        return torch.float32
+    if not torch.cuda.is_available():
+        return torch.float32
+    return torch.bfloat16
 
 
 def parse_max_memory_json(raw: str | None) -> dict[str, Any] | None:
@@ -214,23 +249,30 @@ def load_model_and_tokenizer(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    explicit_device: str | None = None
+    if isinstance(device_map, str) and device_map in {"cpu", "mps"}:
+        explicit_device = device_map
+
     load_kwargs: dict[str, Any] = {
         "config": config,
         "torch_dtype": torch_dtype,
-        "device_map": device_map,
         "trust_remote_code": trust_remote_code,
         "local_files_only": local_files_only,
     }
+    if explicit_device is None:
+        load_kwargs["device_map"] = device_map
     if attn_implementation is not None:
         load_kwargs["attn_implementation"] = attn_implementation
     if max_memory is not None:
         load_kwargs["max_memory"] = max_memory
-    if cpu_offload:
+    if cpu_offload and explicit_device is None:
         load_kwargs["offload_state_dict"] = True
         if offload_folder:
             load_kwargs["offload_folder"] = offload_folder
 
     model = model_cls.from_pretrained(model_path, **load_kwargs)
+    if explicit_device is not None:
+        model.to(explicit_device)
     model.eval()
 
     owner, _, stack_path = get_text_layer_owner(model)
@@ -244,8 +286,33 @@ def load_model_and_tokenizer(
         "num_layers": num_layers,
         "device_map_arg": device_map,
         "hf_device_map": getattr(model, "hf_device_map", None),
+        "execution_device": explicit_device,
+        "torch_dtype": str(torch_dtype).replace("torch.", ""),
     }
     return tokenizer, model, metadata
+
+
+def model_input_device(model: Any) -> torch.device:
+    """Return the device that should be used for model inputs."""
+    return next(model.parameters()).device
+
+
+def maybe_empty_cache(device: torch.device | str | None = None) -> None:
+    """Best-effort cache cleanup across CUDA and MPS backends."""
+    dev_type = None
+    if isinstance(device, torch.device):
+        dev_type = device.type
+    elif isinstance(device, str):
+        dev_type = device.split(":", 1)[0]
+
+    if dev_type == "cuda" and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        return
+    if dev_type == "mps" and hasattr(torch, "mps"):
+        try:
+            torch.mps.empty_cache()
+        except Exception:
+            pass
 
 
 def is_moe_model(model) -> bool:

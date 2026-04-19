@@ -52,8 +52,11 @@ from src.workers.model_utils import (
     build_teacher_forced_inputs,
     is_moe_model,
     load_model_and_tokenizer,
+    maybe_empty_cache,
+    model_input_device,
     parse_device_map_arg,
     parse_max_memory_json,
+    parse_torch_dtype_arg,
     score_teacher_forced_inputs,
     strip_thinking,
 )
@@ -505,8 +508,11 @@ def main():
                         help="Whether to enable HuggingFace trust_remote_code when loading model/tokenizer")
     parser.add_argument("--local-files-only", action=argparse.BooleanOptionalAction, default=False,
                         help="Load model/tokenizer from local files only (no Hub fetch)")
-    parser.add_argument("--device-map", type=str, default="cuda:0",
-                        help="HF device_map value: e.g. 'cuda:0', 'auto', or JSON object string")
+    parser.add_argument("--device-map", type=str, default="auto",
+                        help="HF device_map value: e.g. 'mps', 'cpu', 'cuda:0', 'auto', or JSON object string")
+    parser.add_argument("--torch-dtype", type=str, default="auto",
+                        choices=["auto", "bfloat16", "float16", "float32"],
+                        help="Torch dtype used when loading the model")
     parser.add_argument("--max-memory-json", type=str, default=None,
                         help="Optional max_memory JSON, e.g. '{\"cuda:0\":\"80GiB\",\"cuda:1\":\"80GiB\"}'")
     parser.add_argument("--cpu-offload", action=argparse.BooleanOptionalAction, default=False,
@@ -534,6 +540,8 @@ def main():
     parser.add_argument("--config-file", type=str, default=None,
                         help="File with configs (one per line). Lines starting with 'layers:' are layer lists, "
                              "otherwise treated as block specs. Bypasses queue.")
+    parser.add_argument("--dataset-limit", type=int, default=None,
+                        help="Optional limit on number of benchmark examples for fast local runs")
 
     args = parser.parse_args()
 
@@ -551,6 +559,8 @@ def main():
         raise ValueError("--preflight-max-new must be >= 1")
     if not (0.0 <= args.preflight_min_extract_rate <= 1.0):
         raise ValueError("--preflight-min-extract-rate must be in [0, 1]")
+    if args.dataset_limit is not None and args.dataset_limit < 1:
+        raise ValueError("--dataset-limit must be >= 1")
 
     try:
         resolved_device_map = parse_device_map_arg(args.device_map)
@@ -560,11 +570,20 @@ def main():
         resolved_max_memory = parse_max_memory_json(args.max_memory_json)
     except Exception as exc:
         raise ValueError(f"Invalid --max-memory-json value: {exc}") from exc
+    try:
+        resolved_torch_dtype = parse_torch_dtype_arg(args.torch_dtype, device_map=resolved_device_map)
+    except Exception as exc:
+        raise ValueError(f"Invalid --torch-dtype value: {exc}") from exc
 
-    # Auto-detect worker ID from GPU
+    # Auto-detect worker ID from the resolved execution target.
     if args.worker_id is None:
-        cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', '0')
-        args.worker_id = f"GPU{cuda_visible}"
+        if isinstance(resolved_device_map, str) and resolved_device_map.startswith("cuda"):
+            worker_suffix = resolved_device_map.split(":", 1)[1] if ":" in resolved_device_map else os.environ.get('CUDA_VISIBLE_DEVICES', '0')
+            args.worker_id = f"GPU{worker_suffix}"
+        elif isinstance(resolved_device_map, str):
+            args.worker_id = resolved_device_map.upper()
+        else:
+            args.worker_id = "WORKER"
 
     print("=" * 80)
     print(f"MoE Worker [{args.worker_id}]")
@@ -577,21 +596,11 @@ def main():
     print(f"Teacher-forced proxy: enabled (reduction={args.proxy_reduction})")
     print(f"Padding mode: {args.padding_mode}")
     print(f"Adaptive retry: {args.adaptive_batch_retry} (min={args.min_batch_size}, max_retries={args.max_retries_per_phase})")
-    print(
-        "Preflight: "
-        + (
-            "disabled"
-            if args.skip_preflight
-            else (
-                "enabled "
-                f"(samples={args.preflight_samples}, max_new={args.preflight_max_new}, "
-                f"min_extract_rate={args.preflight_min_extract_rate:.2f})"
-            )
-        )
-    )
+    print("Preflight: disabled in proxy branch")
     print(f"Trust remote: {args.trust_remote_code}")
     print(f"Local files only: {args.local_files_only}")
     print(f"Device map: {resolved_device_map}")
+    print(f"Torch dtype: {resolved_torch_dtype}")
     if resolved_max_memory is not None:
         print(f"Max memory: {resolved_max_memory}")
     print(f"CPU offload: {args.cpu_offload} (folder={args.offload_folder})")
@@ -612,6 +621,9 @@ def main():
     print(f"\nLoading dataset from {args.dataset_path}")
     with open(args.dataset_path, "r") as f:
         dataset = json.load(f)
+    if args.dataset_limit is not None:
+        dataset = dict(list(dataset.items())[: args.dataset_limit])
+        print(f"Dataset limit applied: {args.dataset_limit}")
     print(f"Loaded {len(dataset)} math questions")
 
     # Load model
@@ -621,7 +633,7 @@ def main():
         model_path=args.model_path,
         trust_remote_code=args.trust_remote_code,
         local_files_only=args.local_files_only,
-        torch_dtype=torch.bfloat16,
+        torch_dtype=resolved_torch_dtype,
         device_map=resolved_device_map,
         attn_implementation=attn_impl,
         max_memory=resolved_max_memory,
@@ -631,6 +643,7 @@ def main():
     num_layers = int(load_meta["num_layers"])
     print(f"Loader: {load_meta['loader']} | architectures={load_meta['architectures']} | text_stack={load_meta['text_stack']}")
     print(f"Resolved HF device map: {load_meta.get('hf_device_map')}")
+    print(f"Execution device: {load_meta.get('execution_device') or model_input_device(model)}")
     print(f"Model has {num_layers} text layers")
 
     # Detect model type (MoE vs dense)
@@ -647,12 +660,9 @@ def main():
     teacher_forced_dataset = pretokenize_teacher_forced_dataset(
         dataset,
         tokenizer,
-        model.device,
+        model_input_device(model),
         use_no_think_prefix=args.use_no_think_prefix,
     )
-
-    if not args.skip_preflight:
-        print("Preflight skipped in proxy branch.")
 
     def run_math_proxy(run_model):
         """Run teacher-forced proxy scoring for math."""
@@ -747,7 +757,7 @@ def main():
                 dup_model = build_duplicated_model(model, layer_indices)
                 result, effective_batch, retries = run_math_proxy(dup_model)
                 del dup_model
-                torch.cuda.empty_cache()
+                maybe_empty_cache(model_input_device(model))
 
             elapsed = time.time() - config_start
             score = result['score']
@@ -812,7 +822,7 @@ def main():
 
             # Explicit memory cleanup
             del dup_model
-            torch.cuda.empty_cache()
+            maybe_empty_cache(model_input_device(model))
 
         config_time = time.time() - config_start_time
         configs_processed += 1

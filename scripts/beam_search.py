@@ -181,10 +181,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eq-batch-size", type=int, default=16)
     parser.add_argument("--math-max-new", type=int, default=64)
     parser.add_argument("--eq-max-new", type=int, default=64)
+    parser.add_argument(
+        "--dataset-limit",
+        type=int,
+        default=None,
+        help="Optional limit on benchmark examples per worker for fast local debugging.",
+    )
 
     parser.add_argument("--padding-mode", default="inprompt_space", choices=["masked", "inprompt_space"])
     parser.add_argument("--attention-impl", default="eager", choices=["eager", "flash_attention_2", "sdpa"])
     parser.add_argument("--device-map", default="cuda:0")
+    parser.add_argument(
+        "--torch-dtype",
+        default="auto",
+        choices=["auto", "bfloat16", "float16", "float32"],
+        help="Torch dtype forwarded to Hugging Face workers.",
+    )
     parser.add_argument(
         "--math-device-map",
         default=None,
@@ -764,6 +776,27 @@ def run_workers_parallel(
                 pass
 
 
+def workers_share_device(args: argparse.Namespace) -> bool:
+    """Return True when math and EQ workers target the same device map."""
+    math_device = args.math_device_map or args.device_map
+    eq_device = args.eq_device_map or args.device_map
+    return str(math_device) == str(eq_device)
+
+
+def run_workers(
+    *,
+    runs: list[tuple[list[str], Path]],
+    cwd: Path,
+    dry_run: bool,
+    sequential: bool,
+) -> None:
+    if sequential:
+        for cmd, log_path in runs:
+            run_worker(cmd=cmd, cwd=cwd, log_path=log_path, dry_run=dry_run)
+        return
+    run_workers_parallel(runs=runs, cwd=cwd, dry_run=dry_run)
+
+
 def build_math_worker_cmd(
     *,
     args: argparse.Namespace,
@@ -799,6 +832,8 @@ def build_math_worker_cmd(
         args.attention_impl,
         "--device-map",
         device_map,
+        "--torch-dtype",
+        args.torch_dtype,
         "--worker-id",
         worker_id,
     ]
@@ -806,6 +841,8 @@ def build_math_worker_cmd(
         cmd.extend(["--config-file", str(config_file)])
     if queue_file is not None:
         cmd.extend(["--queue-file", str(queue_file)])
+    if args.dataset_limit is not None:
+        cmd.extend(["--dataset-limit", str(args.dataset_limit)])
     if args.skip_worker_preflight:
         cmd.append("--skip-preflight")
     if args.local_files_only:
@@ -854,6 +891,8 @@ def build_eq_worker_cmd(
         args.attention_impl,
         "--device-map",
         device_map,
+        "--torch-dtype",
+        args.torch_dtype,
         "--worker-id",
         worker_id,
     ]
@@ -861,6 +900,8 @@ def build_eq_worker_cmd(
         cmd.extend(["--config-file", str(config_file)])
     if queue_file is not None:
         cmd.extend(["--queue-file", str(queue_file)])
+    if args.dataset_limit is not None:
+        cmd.extend(["--dataset-limit", str(args.dataset_limit)])
     if args.skip_worker_preflight:
         cmd.append("--skip-preflight")
     if args.local_files_only:
@@ -1085,6 +1126,16 @@ def main() -> None:
         raise ValueError("--monitor-interval-sec must be >= 1")
     if args.overhead_penalty_lambda < 0:
         raise ValueError("--overhead-penalty-lambda must be >= 0")
+    if args.dataset_limit is not None and args.dataset_limit < 1:
+        raise ValueError("--dataset-limit must be >= 1")
+
+    shared_device = workers_share_device(args)
+    if shared_device and args.dynamic_split:
+        print(
+            "Math and EQ workers share one device map; disabling dynamic split "
+            "to avoid concurrent workers on the same device."
+        )
+        args.dynamic_split = False
 
     validate_arbitrary_layer_scheme()
     print("Arbitrary layer expansion validation: OK")
@@ -1175,13 +1226,14 @@ def main() -> None:
                 results_file=seed_rescore_eq_path,
                 depth=0,
             )
-            run_workers_parallel(
+            run_workers(
                 runs=[
                     (math_cmd, work_dir / "beam_math_worker.log"),
                     (eq_cmd, work_dir / "beam_eq_worker.log"),
                 ],
                 cwd=ROOT,
                 dry_run=args.dry_run,
+                sequential=shared_device,
             )
         else:
             print(
@@ -1511,10 +1563,11 @@ def main() -> None:
                 )
                 runs.append((eq_cmd, work_dir / "beam_eq_worker.log"))
             if runs:
-                run_workers_parallel(
+                run_workers(
                     runs=runs,
                     cwd=ROOT,
                     dry_run=args.dry_run,
+                    sequential=shared_device,
                 )
 
         math_layer_scores = load_layer_score_map(math_beam_results_path)
