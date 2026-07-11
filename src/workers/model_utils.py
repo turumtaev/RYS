@@ -372,6 +372,180 @@ class TeacherForcedInputs:
     target_mask: torch.Tensor | None = None
 
 
+@dataclass(frozen=True)
+class PartialForwardState:
+    """Hidden state plus the immutable inputs required by decoder layers."""
+
+    hidden_states: torch.Tensor
+    attention_masks: Any
+    position_ids: torch.Tensor
+    cache_position: torch.Tensor
+    position_embeddings: tuple[torch.Tensor, torch.Tensor]
+
+
+class LlamaLikePartialRunner:
+    """Run arbitrary layer paths for current Llama/Qwen-style HF models.
+
+    This first implementation intentionally disables KV caching. That makes
+    replaying an original layer safe because attention ``layer_idx`` values are
+    not used to address cache slots.
+    """
+
+    def __init__(self, model: Any):
+        decoder, layers_attr, stack_path = get_text_layer_owner(model)
+        missing = [
+            name
+            for name in ("embed_tokens", "norm", "rotary_emb")
+            if not hasattr(decoder, name)
+        ]
+        if missing:
+            raise TypeError(
+                f"Unsupported decoder at {stack_path}: missing {', '.join(missing)}. "
+                "Expected a Llama/Qwen-style decoder stack."
+            )
+
+        output_head = model.get_output_embeddings() if hasattr(model, "get_output_embeddings") else None
+        if output_head is None:
+            raise TypeError("Model does not expose an output embedding / LM head.")
+
+        self.model = model
+        self.decoder = decoder
+        self.layers = getattr(decoder, layers_attr)
+        self.output_head = output_head
+        self.stack_path = stack_path
+
+    @property
+    def num_layers(self) -> int:
+        return len(self.layers)
+
+    def prepare(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+    ) -> PartialForwardState:
+        """Embed a full sequence and prepare mask/position inputs once."""
+        from transformers.masking_utils import (
+            create_causal_mask,
+            create_sliding_window_causal_mask,
+        )
+
+        if input_ids.ndim != 2:
+            raise ValueError("input_ids must have shape [batch, sequence].")
+        if attention_mask is not None and attention_mask.shape != input_ids.shape:
+            raise ValueError("attention_mask must have the same shape as input_ids.")
+
+        hidden_states = self.decoder.embed_tokens(input_ids)
+        cache_position = torch.arange(
+            hidden_states.shape[1],
+            device=hidden_states.device,
+        )
+        if position_ids is None:
+            position_ids = cache_position.unsqueeze(0)
+
+        mask_kwargs = {
+            "config": self.decoder.config,
+            "inputs_embeds": hidden_states,
+            "attention_mask": attention_mask,
+            "cache_position": cache_position,
+            "past_key_values": None,
+            "position_ids": position_ids,
+        }
+        full_mask = create_causal_mask(**mask_kwargs)
+        if getattr(self.decoder, "has_sliding_layers", False):
+            attention_masks: Any = {
+                "full_attention": full_mask,
+                "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
+            }
+        else:
+            attention_masks = full_mask
+
+        position_embeddings = self.decoder.rotary_emb(
+            hidden_states,
+            position_ids=position_ids,
+        )
+        return PartialForwardState(
+            hidden_states=hidden_states,
+            attention_masks=attention_masks,
+            position_ids=position_ids,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+        )
+
+    def run_layer_indices(
+        self,
+        state: PartialForwardState,
+        layer_indices: list[int] | tuple[int, ...] | range,
+    ) -> PartialForwardState:
+        """Run an arbitrary layer path, including repeated indices."""
+        hidden_states = state.hidden_states
+        for raw_idx in layer_indices:
+            idx = int(raw_idx)
+            if idx < 0 or idx >= self.num_layers:
+                raise ValueError(f"Layer index {idx} out of range [0, {self.num_layers}).")
+
+            layer = self.layers[idx]
+            attention_mask = state.attention_masks
+            if isinstance(attention_mask, dict):
+                attention_type = getattr(layer, "attention_type", "full_attention")
+                if attention_type not in attention_mask:
+                    raise ValueError(f"No prepared attention mask for type {attention_type!r}.")
+                attention_mask = attention_mask[attention_type]
+
+            layer_output = layer(
+                hidden_states,
+                attention_mask=attention_mask,
+                position_embeddings=state.position_embeddings,
+                position_ids=state.position_ids,
+                past_key_values=None,
+                use_cache=False,
+                cache_position=state.cache_position,
+            )
+            hidden_states = layer_output[0] if isinstance(layer_output, (tuple, list)) else layer_output
+
+        return PartialForwardState(
+            hidden_states=hidden_states,
+            attention_masks=state.attention_masks,
+            position_ids=state.position_ids,
+            cache_position=state.cache_position,
+            position_embeddings=state.position_embeddings,
+        )
+
+    def run_range(
+        self,
+        state: PartialForwardState,
+        start: int,
+        end: int,
+    ) -> PartialForwardState:
+        """Run the half-open original-layer range ``[start, end)``."""
+        if start < 0 or end < start or end > self.num_layers:
+            raise ValueError(f"Invalid layer range [{start}, {end}) for {self.num_layers} layers.")
+        return self.run_layer_indices(state, range(start, end))
+
+    def logits(self, state: PartialForwardState) -> torch.Tensor:
+        """Apply final normalization and the model's output head."""
+        return self.output_head(self.decoder.norm(state.hidden_states))
+
+    def forward_path(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        layer_indices: list[int] | tuple[int, ...] | range | None = None,
+        position_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Run one complete custom layer path and return token logits."""
+        state = self.prepare(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+        )
+        path = range(self.num_layers) if layer_indices is None else layer_indices
+        state = self.run_layer_indices(state, path)
+        return self.logits(state)
+
+
 def _move_tensor_batch(
     batch: dict[str, torch.Tensor],
     device: torch.device | str | None,

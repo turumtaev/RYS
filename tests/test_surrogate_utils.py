@@ -4,10 +4,21 @@ import math
 import unittest
 
 import torch
+from transformers import (
+    LlamaConfig,
+    LlamaForCausalLM,
+    Qwen2Config,
+    Qwen2ForCausalLM,
+)
 
+from src.core.layer_duplicator import build_model_with_layers
 from src.workers.eq_worker import build_eq_first_pass_target, serialize_eq_first_pass_target
 from src.workers.math_worker import build_math_target, serialize_math_target
-from src.workers.model_utils import gather_target_token_logprobs, reduce_logprobs
+from src.workers.model_utils import (
+    LlamaLikePartialRunner,
+    gather_target_token_logprobs,
+    reduce_logprobs,
+)
 from src.utils.surrogate_utils import (
     count_vector_to_layers,
     counts_from_csv,
@@ -19,6 +30,39 @@ from src.utils.surrogate_utils import (
 
 
 class SurrogateUtilsTests(unittest.TestCase):
+    @staticmethod
+    def _tiny_llama() -> LlamaForCausalLM:
+        torch.manual_seed(7)
+        config = LlamaConfig(
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=3,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=32,
+            pad_token_id=0,
+        )
+        return LlamaForCausalLM(config).eval()
+
+    @staticmethod
+    def _tiny_qwen2() -> Qwen2ForCausalLM:
+        torch.manual_seed(11)
+        config = Qwen2Config(
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=3,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=32,
+            use_sliding_window=True,
+            sliding_window=2,
+            layer_types=["full_attention", "sliding_attention", "full_attention"],
+            pad_token_id=0,
+        )
+        return Qwen2ForCausalLM(config).eval()
+
     def test_key_to_count_vector_roundtrip(self):
         key = (0, 1, 2, 1, 2, 3)
         counts = key_to_count_vector(key, num_layers=4)
@@ -108,6 +152,85 @@ class SurrogateUtilsTests(unittest.TestCase):
                 rel_tol=1e-6,
             )
         )
+
+    def test_partial_runner_matches_full_forward_and_split_execution(self):
+        model = self._tiny_llama()
+        runner = LlamaLikePartialRunner(model)
+        input_ids = torch.tensor([[1, 2, 3, 4], [0, 5, 6, 7]])
+        attention_mask = torch.tensor([[1, 1, 1, 1], [0, 1, 1, 1]])
+
+        with torch.no_grad():
+            expected = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=False,
+            ).logits
+            actual = runner.forward_path(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+            )
+
+            state = runner.prepare(input_ids=input_ids, attention_mask=attention_mask)
+            state = runner.run_range(state, 0, 1)
+            state = runner.run_range(state, 1, runner.num_layers)
+            split_actual = runner.logits(state)
+
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(split_actual, expected, rtol=1e-5, atol=1e-6)
+
+    def test_partial_runner_repeated_path_matches_duplicated_model(self):
+        model = self._tiny_llama()
+        runner = LlamaLikePartialRunner(model)
+        layer_path = [0, 0, 1, 2]
+        input_ids = torch.tensor([[1, 2, 3, 4]])
+        attention_mask = torch.ones_like(input_ids)
+        duplicated_model = build_model_with_layers(model, layer_path)
+
+        with torch.no_grad():
+            expected = duplicated_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=False,
+            ).logits
+            actual = runner.forward_path(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                layer_indices=layer_path,
+            )
+
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+
+    def test_partial_runner_matches_qwen2_with_sliding_attention(self):
+        model = self._tiny_qwen2()
+        runner = LlamaLikePartialRunner(model)
+        layer_path = [0, 1, 1, 2]
+        input_ids = torch.tensor([[1, 2, 3, 4, 5]])
+        attention_mask = torch.ones_like(input_ids)
+        duplicated_model = build_model_with_layers(model, layer_path)
+
+        with torch.no_grad():
+            expected = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=False,
+            ).logits
+            actual = runner.forward_path(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+            )
+            expected_repeat = duplicated_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=False,
+            ).logits
+            actual_repeat = runner.forward_path(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                layer_indices=layer_path,
+            )
+
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(actual_repeat, expected_repeat, rtol=1e-5, atol=1e-6)
 
 
 if __name__ == "__main__":

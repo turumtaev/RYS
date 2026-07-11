@@ -160,6 +160,8 @@ This branch currently implements only the **supporting infrastructure** for the 
 - teacher-forced proxy scoring in `math_worker`
 - teacher-forced proxy scoring in `eq_worker`
 - EQ numeric-token masking
+- uncached partial-layer execution for Llama/Qwen-style decoder stacks
+- arbitrary and repeated layer paths without rebuilding the model stack
 - Mac-compatible local environment
 - small local smoke validation
 
@@ -178,15 +180,16 @@ We are at "proxy scoring infra works and can be used to build suffix search".
 
 We are in:
 
-- `Stage B: local validation of the proxy/search infrastructure`
+- `Stage D: uncached suffix-search driver`
 
 Status:
 
 - proxy scoring is implemented
 - Mac environment is working
 - focused tests are passing
-- real Math smoke run is passing on CPU
-- MPS is still unavailable on this machine
+- real Math and EQ smoke runs are passing
+- MPS is available in normal, unsandboxed execution
+- partial and repeated layer paths match Hugging Face full-model execution
 
 ## 9. Completed Work
 
@@ -219,28 +222,35 @@ Validation already done:
 - `tests/test_surrogate_utils.py`
 - `tests/test_hf_export.py`
 - real Math smoke run with tiny model
+- real EQ smoke run with tiny model
+- synthetic Llama full/split/repeated-path equivalence
+- synthetic Qwen2 full/sliding/repeated-path equivalence
+- real 30-layer SmolLM integration on MPS with exact logits for normal and repeated paths
 
 Smoke result summary:
 
 - baseline proxy score `(0,0)`: `-2.6175`
 - duplicated proxy score `(0,1)`: `-2.8945`
+- EQ baseline proxy score `(0,0)`: `-2.9236`
+- EQ duplicated proxy score `(0,1)`: `-3.9309`
 
 These are log-probability proxy scores, so negative values are expected.
 Closer to `0` is better.
 
 ## 10. Known Issues
 
-### MPS unavailable
+### MPS visibility in sandboxed runs
 
 Observed:
 
 - `torch.backends.mps.is_built() == True`
-- `torch.backends.mps.is_available() == False`
+- inside the restricted Codex sandbox: `is_available() == False`
+- outside the sandbox: `is_available() == True`, one MPS device is visible, and tensor allocation succeeds
 
 Impact:
 
-- CPU smoke runs work
-- larger local runs are slower than they should be
+- normal terminal runs can use `--device-map mps`
+- Codex-run MPS experiments require elevated execution so Metal is visible
 
 ### Search algorithm still missing
 
@@ -268,16 +278,43 @@ Status: done
 
 ### Stage B. Local Mac validation
 
-Status: mostly done
+Status: done
 
-Remaining:
+- Math smoke test passed
+- EQ smoke test passed
+- MPS availability was verified outside the sandbox
 
-- run EQ smoke test
-- understand MPS availability
+### Stage C. Add low-level partial-layer / suffix scorer
 
-### Stage C. Add suffix search driver
+Status: done
 
-Status: next
+Suggested core module:
+
+- `src/core/benchmark_suffix_scorer.py`
+
+First supported architecture family:
+
+- Llama/Qwen-style decoder models exposing `model.layers`
+
+Needed capabilities:
+
+- prepare embeddings, masks, positions, and RoPE inputs
+- run an arbitrary contiguous layer range
+- run a replay window
+- apply final norm and LM head
+- initially operate with `use_cache=False`
+
+Required correctness tests:
+
+1. partial runner over all layers matches normal `model.forward()` logits
+2. repeated layer path matches the existing `LayerDuplicatedModel` proxy score
+
+Both tests pass for synthetic Llama and Qwen2 models. The cached SmolLM model
+also matches exactly on MPS for both normal and repeated paths.
+
+### Stage D. Add suffix search driver
+
+Status: pending
 
 Build the real algorithm as a separate path, not by replacing the current `scripts/beam_search.py` immediately.
 
@@ -294,22 +331,6 @@ Suggested responsibilities:
 5. continue through boundaries
 6. save shortlist
 7. optionally validate shortlist with exact workers
-
-### Stage D. Add low-level suffix scorer
-
-Status: pending
-
-Suggested core module:
-
-- `src/core/benchmark_suffix_scorer.py`
-
-Needed capabilities:
-
-- access decoder layers / final norm / LM head
-- run model from an arbitrary boundary
-- materialize replay-window children
-- batch child scoring on benchmark data
-- manage reusable benchmark-side caches or activations
 
 ### Stage E. Small end-to-end search smoke
 
@@ -355,15 +376,13 @@ Only start after:
 
 In order:
 
-1. Run EQ worker smoke test on Mac with the tiny model.
-2. Restore the original target at the top of this plan file.
-   Status: done.
-3. Build a minimal `benchmark_suffix_beam_search.py` skeleton.
-4. Implement boundary expansion logic for:
+1. Implement boundary expansion logic for:
    - plain child
    - replay child `(m, k+1)` in a limited window
-5. Hook the skeleton to the current proxy scorer first, even without cache reuse.
-6. After that works, add benchmark-side reuse.
+2. Build a minimal uncached suffix-search driver using the current proxy scorer.
+3. Run a tiny end-to-end search with beam width `2`, replay window `2`, and one or two examples.
+4. Add chunked benchmark evaluation.
+5. Profile recomputation versus CPU-stored boundary states before adding cache complexity.
 
 ## 13. Commands We Can Reuse
 
@@ -390,7 +409,7 @@ HF_HOME=.hf-cache .venv/bin/python -m src.workers.math_worker \
   --dataset-limit 1 \
   --batch-size 1 \
   --max-new 16 \
-  --device-map cpu \
+  --device-map mps \
   --torch-dtype float32 \
   --attention-impl eager \
   --no-trust-remote-code
