@@ -123,54 +123,89 @@ def _load_dataset(path: str, limit: int | None, *, offset: int = 0) -> dict[str,
     return dataset
 
 
-def _score_proxy_dataset(
-    runner: LlamaLikePartialRunner,
+def _dataset_chunks(
     dataset: dict[str, dict[str, Any]],
-    layer_path: tuple[int, ...],
-    *,
-    reduction: str,
-) -> float:
-    scores: list[float] = []
-    with torch.inference_mode():
-        for cached in dataset.values():
-            logits = runner.forward_path(
-                input_ids=cached["input_ids"],
-                attention_mask=cached["attention_mask"],
-                layer_indices=layer_path,
-            )
-            result = score_teacher_forced_logits(
-                logits=logits,
-                input_ids=cached["input_ids"],
-                prompt_length=int(cached["prompt_length"]),
-                target_mask=cached.get("target_mask"),
-                reduction=reduction,
-            )
-            scores.append(float(result["score"]))
-    if not scores:
-        raise ValueError("Cannot score an empty proxy dataset.")
-    return sum(scores) / len(scores)
+    chunk_size: int,
+) -> Iterable[list[dict[str, Any]]]:
+    values = list(dataset.values())
+    for start in range(0, len(values), chunk_size):
+        yield values[start : start + chunk_size]
 
 
-def score_candidate(
+def _move_cached_example(cached: dict[str, Any], device: torch.device) -> dict[str, Any]:
+    return {
+        key: value.to(device) if isinstance(value, torch.Tensor) else value
+        for key, value in cached.items()
+    }
+
+
+def score_candidates(
     runner: LlamaLikePartialRunner,
-    candidate: BeamCandidate,
+    candidates: list[BeamCandidate],
     *,
     layer_idx: int,
     math_dataset: dict[str, dict[str, Any]],
     eq_dataset: dict[str, dict[str, Any]],
     reduction: str,
-) -> BeamCandidate:
-    """Score a partial config after completing it with the normal suffix."""
-    full_path = complete_layer_path(candidate, layer_idx=layer_idx, num_layers=runner.num_layers)
-    math_score = _score_proxy_dataset(runner, math_dataset, full_path, reduction=reduction)
-    eq_score = _score_proxy_dataset(runner, eq_dataset, full_path, reduction=reduction)
-    return BeamCandidate(
-        layer_path=candidate.layer_path,
-        replays=candidate.replays,
-        score=(math_score + eq_score) / 2.0,
-        math_score=math_score,
-        eq_score=eq_score,
-    )
+    device: torch.device,
+    chunk_size: int,
+) -> list[BeamCandidate]:
+    """Score complete suffixes while keeping only one benchmark chunk on device."""
+    if not candidates:
+        return []
+
+    layer_paths = [
+        complete_layer_path(candidate, layer_idx=layer_idx, num_layers=runner.num_layers)
+        for candidate in candidates
+    ]
+    metric_scores: dict[str, list[list[float]]] = {
+        "math": [[] for _ in candidates],
+        "eq": [[] for _ in candidates],
+    }
+    with torch.inference_mode():
+        for metric, dataset in (("math", math_dataset), ("eq", eq_dataset)):
+            for cpu_chunk in _dataset_chunks(dataset, chunk_size):
+                device_chunk = [_move_cached_example(cached, device) for cached in cpu_chunk]
+                prepared_chunk = [
+                    runner.prepare(
+                        input_ids=cached["input_ids"],
+                        attention_mask=cached["attention_mask"],
+                    )
+                    for cached in device_chunk
+                ]
+                for candidate_idx, layer_path in enumerate(layer_paths):
+                    for cached, initial_state in zip(device_chunk, prepared_chunk):
+                        final_state = runner.run_layer_indices(initial_state, layer_path)
+                        logits = runner.logits(final_state)
+                        result = score_teacher_forced_logits(
+                            logits=logits,
+                            input_ids=cached["input_ids"],
+                            prompt_length=int(cached["prompt_length"]),
+                            target_mask=cached.get("target_mask"),
+                            reduction=reduction,
+                        )
+                        metric_scores[metric][candidate_idx].append(float(result["score"]))
+                del prepared_chunk
+                del device_chunk
+
+    scored: list[BeamCandidate] = []
+    for idx, candidate in enumerate(candidates):
+        math_values = metric_scores["math"][idx]
+        eq_values = metric_scores["eq"][idx]
+        if not math_values or not eq_values:
+            raise ValueError("Cannot score an empty proxy dataset.")
+        math_score = sum(math_values) / len(math_values)
+        eq_score = sum(eq_values) / len(eq_values)
+        scored.append(
+            BeamCandidate(
+                layer_path=candidate.layer_path,
+                replays=candidate.replays,
+                score=(math_score + eq_score) / 2.0,
+                math_score=math_score,
+                eq_score=eq_score,
+            )
+        )
+    return scored
 
 
 def _candidate_json(candidate: BeamCandidate, *, layer_idx: int, num_layers: int) -> dict[str, Any]:
@@ -208,6 +243,7 @@ def _write_progress(
             "replay_window": args.replay_window,
             "max_extra_layers": args.max_extra_layers,
             "dataset_limit_per_benchmark": args.dataset_limit,
+            "benchmark_chunk_size": args.benchmark_chunk_size,
             "example_reduction": args.reduction,
             "combined_score": "(math_score + eq_score) / 2",
             "requested_final_layer": final_layer,
@@ -363,6 +399,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dataset-limit", type=int, default=None)
     parser.add_argument(
+        "--benchmark-chunk-size",
+        type=int,
+        default=8,
+        help="Tokenized examples moved from CPU to the accelerator at once.",
+    )
+    parser.add_argument(
         "--exact-dataset-offset",
         type=int,
         default=0,
@@ -411,6 +453,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max-extra-layers must be >= 0.")
     if args.dataset_limit is not None and args.dataset_limit < 1:
         raise ValueError("--dataset-limit must be >= 1.")
+    if args.benchmark_chunk_size < 1:
+        raise ValueError("--benchmark-chunk-size must be >= 1.")
     if args.exact_dataset_offset < 0:
         raise ValueError("--exact-dataset-offset must be >= 0.")
     if args.exact_dataset_limit is not None and args.exact_dataset_limit < 1:
@@ -441,8 +485,8 @@ def main() -> None:
 
     math_raw = _load_dataset(args.math_dataset_path, args.dataset_limit)
     eq_raw = _load_dataset(args.eq_dataset_path, args.dataset_limit)
-    math_dataset = pretokenize_teacher_forced_dataset(math_raw, tokenizer, device)
-    eq_dataset = pretokenize_eq_teacher_forced_dataset(eq_raw, tokenizer, device)
+    math_dataset = pretokenize_teacher_forced_dataset(math_raw, tokenizer, torch.device("cpu"))
+    eq_dataset = pretokenize_eq_teacher_forced_dataset(eq_raw, tokenizer, torch.device("cpu"))
 
     final_layer = runner.num_layers - 1
     if args.stop_after_layer is not None:
@@ -462,17 +506,16 @@ def main() -> None:
             num_layers=runner.num_layers,
             max_extra_layers=args.max_extra_layers,
         )
-        scored = [
-            score_candidate(
-                runner,
-                child,
-                layer_idx=layer_idx,
-                math_dataset=math_dataset,
-                eq_dataset=eq_dataset,
-                reduction=args.reduction,
-            )
-            for child in children
-        ]
+        scored = score_candidates(
+            runner,
+            children,
+            layer_idx=layer_idx,
+            math_dataset=math_dataset,
+            eq_dataset=eq_dataset,
+            reduction=args.reduction,
+            device=device,
+            chunk_size=args.benchmark_chunk_size,
+        )
         scored.sort(key=lambda candidate: float(candidate.score), reverse=True)
         if layer_idx == 0:
             baseline = next(candidate for candidate in scored if not candidate.replays)

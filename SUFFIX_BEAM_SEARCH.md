@@ -425,13 +425,62 @@ Only start after:
 2. suffix-search smoke test runs end to end
 3. proxy ranking looks directionally useful
 
+### Benchmark chunking
+
+Status: done
+
+- teacher-forced benchmark tensors remain in CPU memory
+- only one configurable chunk is moved to the accelerator
+- all child architectures are scored before that chunk is released
+- `--benchmark-chunk-size` defaults to `8`
+
+Qwen MPS equivalence probe with four Math and four EQ examples:
+
+- chunk sizes `1` and `4` produced bit-identical scores and beam paths
+- chunk size `1`: `30.3s` through boundary 2
+- chunk size `4`: `14.2s` through boundary 2
+
+Small chunks reduce peak residency but add substantial transfer and dispatch
+overhead. Chunk size should therefore be the largest value that fits alongside
+the model and any future boundary-state cache.
+
+### CPU activation-cache profile
+
+Status: profile supports implementation
+
+Qwen2.5-0.5B, float16, boundary 12, four Math plus four EQ examples:
+
+- median prefix recomputation: `47.5ms` per example
+- median CPU-to-MPS hidden-state reload: `0.168ms`
+- median MPS-to-CPU offload: `0.480ms`
+- recomputation / reload ratio: about `283x`
+- eight-example cache size: `6.19 MiB` per candidate boundary
+
+Full 16+16 benchmark footprint:
+
+- total teacher-forced tokens: `14,598`
+- cache per candidate boundary: `24.95 MiB`
+- beam 8: about `200 MiB`
+- beam 12: about `299 MiB`
+- beam 24: about `599 MiB`
+
+CPU RAM and transfer speed are therefore sufficient on the Mac. The cache
+implementation should use two passes at each boundary:
+
+1. score all children from cached parent states without retaining every child
+2. prune globally, then recompute only the top children's short local expansion
+   and offload those boundary states for the next step
+
+This keeps resident CPU cache proportional to the beam width instead of the
+full branching factor `C * (1 + W)`.
+
 ## 12. Immediate Next Tasks
 
 In order:
 
-1. Add benchmark chunking for larger proxy datasets.
-2. Profile full recomputation against CPU-stored boundary activations.
-3. Implement activation reuse only if transfer profiling shows a real speedup.
+1. Implement two-pass CPU boundary-state reuse.
+2. Verify cached and uncached searches produce identical scores and beams.
+3. Measure end-to-end speedup on Qwen2.5-0.5B.
 4. Sweep larger replay budgets with exact held-out validation.
 
 ## 13. Commands We Can Reuse

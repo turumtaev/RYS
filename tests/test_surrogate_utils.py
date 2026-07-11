@@ -16,11 +16,13 @@ from transformers import (
 
 from scripts.beam_search import (
     BeamCandidate,
+    _dataset_chunks,
     _load_dataset,
     _write_exact_validation,
     complete_layer_path,
     expand_beam,
     expand_candidate,
+    score_candidates,
 )
 from src.core.layer_duplicator import build_model_with_layers
 from src.workers.eq_worker import build_eq_first_pass_target, serialize_eq_first_pass_target
@@ -280,6 +282,55 @@ class SurrogateUtilsTests(unittest.TestCase):
             selected = _load_dataset(str(dataset_path), 1, offset=1)
 
         self.assertEqual(selected, {"b": 2})
+
+    def test_chunked_candidate_scoring_is_chunk_size_invariant(self):
+        model = self._tiny_llama()
+        runner = LlamaLikePartialRunner(model)
+        dataset = {
+            "a": {
+                "input_ids": torch.tensor([[1, 2, 3, 4]]),
+                "attention_mask": torch.ones((1, 4), dtype=torch.long),
+                "prompt_length": 2,
+                "target_mask": torch.tensor([[True, True]]),
+            },
+            "b": {
+                "input_ids": torch.tensor([[5, 6, 7, 8]]),
+                "attention_mask": torch.ones((1, 4), dtype=torch.long),
+                "prompt_length": 2,
+                "target_mask": torch.tensor([[True, False]]),
+            },
+        }
+        candidates = [
+            BeamCandidate(layer_path=(0,), replays=()),
+            BeamCandidate(layer_path=(0, 0), replays=((0, 1),)),
+        ]
+
+        chunked = score_candidates(
+            runner,
+            candidates,
+            layer_idx=0,
+            math_dataset=dataset,
+            eq_dataset=dataset,
+            reduction="mean",
+            device=torch.device("cpu"),
+            chunk_size=1,
+        )
+        unchunked = score_candidates(
+            runner,
+            candidates,
+            layer_idx=0,
+            math_dataset=dataset,
+            eq_dataset=dataset,
+            reduction="mean",
+            device=torch.device("cpu"),
+            chunk_size=2,
+        )
+
+        self.assertEqual(len(list(_dataset_chunks(dataset, 1))), 2)
+        for chunked_candidate, unchunked_candidate in zip(chunked, unchunked):
+            self.assertAlmostEqual(chunked_candidate.score, unchunked_candidate.score)
+            self.assertAlmostEqual(chunked_candidate.math_score, unchunked_candidate.math_score)
+            self.assertAlmostEqual(chunked_candidate.eq_score, unchunked_candidate.eq_score)
 
     def test_partial_runner_matches_full_forward_and_split_execution(self):
         model = self._tiny_llama()
