@@ -355,15 +355,15 @@ Observed result with one Math and one EQ example:
 - beam width: `2`
 - replay window: `2`
 - baseline proxy: `-2.770594`
-- best final proxy: `-2.283013`
-- search time on MPS: `23.3s`
+- best final proxy: `-2.260116`
+- search time on MPS: `23.4s`
 
 This result proves the mechanics, not benchmark quality. Two examples are far
 too few to judge whether the selected replay configuration generalizes.
 
 ### Stage F. Correlation / shortlist validation
 
-Status: pending
+Status: local held-out validation passed with a strict replay budget
 
 Goal:
 
@@ -373,6 +373,47 @@ Goal:
 Purpose:
 
 - test whether proxy ranking is useful enough
+
+Initial four-example result with the tiny model:
+
+- baseline proxy: `-2.846952`
+- best beam proxy: `-2.340805`
+- baseline exact combined score: `0.435214`
+- best-proxy beam exact combined score: `0.335484`
+- baseline exact Math / EQ: `0.312095 / 0.558333`
+- best-proxy beam exact Math / EQ: `0.049093 / 0.621875`
+- proxy order: `beam_1, beam_2, baseline`
+- exact order: `baseline, beam_2, beam_1`
+
+The proxy-selected architecture improved exact EQ but substantially harmed
+exact Math generation. Its Math outputs collapsed to a repeated large integer.
+The mismatch remains with the workers' full generation limits, so it is not a
+truncation artifact. This means the current teacher-forced combined objective
+is not yet reliable enough to justify cache optimization or GPU-scale search.
+
+However, this is still a tiny-model result. The 135M baseline is itself poor at
+the benchmark, so the next correlation test should use a locally runnable model
+that can produce valid Math and EQ answers before changing the proxy design.
+
+Follow-up with `Qwen/Qwen2.5-0.5B-Instruct`:
+
+- without a useful extra-layer cap, replay accumulation again caused repetitive
+  Math generation and exact regression
+- with `max_extra_layers=2`, the search retained two distinct candidates
+- search set: first four Math and EQ examples
+- held-out exact set: next four Math and EQ examples
+- baseline exact combined: `0.414625`
+- beam 1 exact combined: `0.509368`
+- beam 2 exact combined: `0.466968`
+- proxy order: `beam_1, beam_2, baseline`
+- held-out exact order: `beam_1, beam_2, baseline`
+
+Conclusion: the teacher-forced objective is useful for shortlist construction
+when architecture growth is constrained, but large replay budgets cause the
+greedy beam to over-relayer and collapse generation. Exact shortlist validation
+remains required. The safe local default is therefore two extra layers; larger
+budgets should be tested as an explicit sweep rather than inherited from the
+author's different search algorithm.
 
 ### Stage G. GPU experiments
 
@@ -388,10 +429,10 @@ Only start after:
 
 In order:
 
-1. Run the search on a larger local subset and compare proxy rankings with exact generation.
-2. Add chunked benchmark evaluation.
-3. Profile recomputation versus CPU-stored boundary states before adding cache complexity.
-4. Wire exact generation-based shortlist validation into the driver.
+1. Add benchmark chunking for larger proxy datasets.
+2. Profile full recomputation against CPU-stored boundary activations.
+3. Implement activation reuse only if transfer profiling shows a real speedup.
+4. Sweep larger replay budgets with exact held-out validation.
 
 ## 13. Commands We Can Reuse
 
@@ -435,6 +476,22 @@ HF_HOME=.hf-cache .venv/bin/python scripts/beam_search.py \
   --beam-width 2 \
   --replay-window 2 \
   --output results/mac_smoke/suffix_beam_search_full.json
+```
+
+### Proxy search with exact shortlist validation
+
+```bash
+HF_HOME=.hf-cache .venv/bin/python scripts/beam_search.py \
+  --model-path HuggingFaceTB/SmolLM2-135M-Instruct \
+  --device-map mps \
+  --torch-dtype float32 \
+  --dataset-limit 4 \
+  --beam-width 2 \
+  --replay-window 2 \
+  --exact-top-k 2 \
+  --math-max-new 64 \
+  --eq-max-new 384 \
+  --output results/mac_smoke/suffix_beam_search_validation_4_full_generation.json
 ```
 
 ## 14. Branches

@@ -16,11 +16,22 @@ from typing import Any, Iterable
 
 import torch
 
-from src.workers.eq_worker import pretokenize_eq_teacher_forced_dataset
-from src.workers.math_worker import pretokenize_teacher_forced_dataset
+from src.core.layer_duplicator import build_model_with_layers
+from src.workers.eq_worker import (
+    pretokenize_eq_dataset,
+    pretokenize_eq_teacher_forced_dataset,
+    run_eq_test,
+)
+from src.workers.math_worker import (
+    pretokenize_dataset,
+    pretokenize_teacher_forced_dataset,
+    run_math_test_batched_moe,
+)
 from src.workers.model_utils import (
     LlamaLikePartialRunner,
+    get_text_num_layers,
     load_model_and_tokenizer,
+    maybe_empty_cache,
     model_input_device,
     parse_device_map_arg,
     parse_torch_dtype_arg,
@@ -98,13 +109,17 @@ def complete_layer_path(candidate: BeamCandidate, *, layer_idx: int, num_layers:
     return candidate.layer_path + tuple(range(layer_idx + 1, num_layers))
 
 
-def _load_dataset(path: str, limit: int | None) -> dict[str, Any]:
+def _load_dataset(path: str, limit: int | None, *, offset: int = 0) -> dict[str, Any]:
     with Path(path).open() as handle:
         dataset = json.load(handle)
     if not isinstance(dataset, dict):
         raise ValueError(f"Expected an object dataset in {path}.")
+    items = list(dataset.items())[offset:]
     if limit is not None:
-        dataset = dict(list(dataset.items())[:limit])
+        items = items[:limit]
+    dataset = dict(items)
+    if not dataset:
+        raise ValueError(f"Dataset selection for {path} is empty (offset={offset}, limit={limit}).")
     return dataset
 
 
@@ -179,9 +194,13 @@ def _write_progress(
     elapsed_seconds: float,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    finished_proxy_search = layer_idx == final_layer
+    status = "running"
+    if finished_proxy_search:
+        status = "proxy_complete" if args.exact_top_k > 0 else "complete"
     payload = {
         "algorithm": "benchmark_conditioned_suffix_beam_search",
-        "status": "complete" if layer_idx == final_layer else "running",
+        "status": status,
         "full_model_search": final_layer == model_metadata["num_layers"] - 1,
         "model": model_metadata,
         "search": {
@@ -205,6 +224,129 @@ def _write_progress(
     temporary.replace(output_path)
 
 
+def _write_exact_validation(
+    output_path: Path,
+    results: list[dict[str, Any]],
+    *,
+    math_max_new: int,
+    eq_max_new: int,
+    batch_size: int,
+    dataset_offset: int,
+) -> None:
+    payload = json.loads(output_path.read_text())
+    proxy_order = [
+        item["label"]
+        for item in sorted(results, key=lambda item: item["proxy_score"], reverse=True)
+    ]
+    exact_order = [
+        item["label"]
+        for item in sorted(results, key=lambda item: item["score"], reverse=True)
+    ]
+    payload["status"] = "complete"
+    payload["exact_validation"] = {
+        "combined_score": "(math_score + eq_score) / 2",
+        "math_max_new": math_max_new,
+        "eq_max_new": eq_max_new,
+        "batch_size": batch_size,
+        "dataset_offset": dataset_offset,
+        "examples_per_benchmark": len(results[0]["math_responses"]),
+        "proxy_order": proxy_order,
+        "exact_order": exact_order,
+        "top_rank_agrees": proxy_order[0] == exact_order[0],
+        "candidates": results,
+    }
+    temporary = output_path.with_suffix(output_path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2) + "\n")
+    temporary.replace(output_path)
+
+
+def run_exact_validation(
+    *,
+    model: Any,
+    tokenizer: Any,
+    device: torch.device,
+    math_dataset: dict[str, Any],
+    eq_dataset: dict[str, Any],
+    baseline_proxy_score: float,
+    beam: list[BeamCandidate],
+    last_layer: int,
+    top_k: int,
+    math_max_new: int,
+    eq_max_new: int,
+    batch_size: int,
+) -> list[dict[str, Any]]:
+    """Generation-score the baseline and top proxy candidates."""
+    exact_math = pretokenize_dataset(math_dataset, tokenizer, device)
+    exact_eq = pretokenize_eq_dataset(eq_dataset, tokenizer, device)
+    num_layers = get_text_num_layers(model)
+    requested = [
+        ("baseline", tuple(range(num_layers)), baseline_proxy_score, ()),
+        *[
+            (
+                f"beam_{rank}",
+                complete_layer_path(candidate, layer_idx=last_layer, num_layers=num_layers),
+                candidate.score,
+                candidate.replays,
+            )
+            for rank, candidate in enumerate(beam[:top_k], start=1)
+        ],
+    ]
+
+    results: list[dict[str, Any]] = []
+    seen_paths: set[tuple[int, ...]] = set()
+    for label, layer_path, proxy_score, replays in requested:
+        if layer_path in seen_paths:
+            continue
+        seen_paths.add(layer_path)
+        run_model = (
+            model
+            if layer_path == tuple(range(num_layers))
+            else build_model_with_layers(model, list(layer_path))
+        )
+        started = time.monotonic()
+        math_result = run_math_test_batched_moe(
+            run_model,
+            exact_math,
+            tokenizer,
+            batch_size=batch_size,
+            max_new_tokens=math_max_new,
+            save_responses=True,
+        )
+        eq_result = run_eq_test(
+            run_model,
+            exact_eq,
+            tokenizer,
+            batch_size=batch_size,
+            max_new_tokens=eq_max_new,
+            save_responses=True,
+        )
+        math_score = float(math_result["score"])
+        eq_score = float(eq_result["score"])
+        result = {
+            "label": label,
+            "layer_path": list(layer_path),
+            "replays": [list(block) for block in replays],
+            "proxy_score": float(proxy_score),
+            "math_score": math_score,
+            "eq_score": eq_score,
+            "score": (math_score + eq_score) / 2.0,
+            "elapsed_seconds": time.monotonic() - started,
+            "math_responses": math_result.get("responses", []),
+            "eq_responses": eq_result.get("responses", []),
+        }
+        results.append(result)
+        print(
+            f"exact label={label} score={result['score']:.6f} "
+            f"math={math_score:.6f} eq={eq_score:.6f} "
+            f"elapsed={result['elapsed_seconds']:.1f}s",
+            flush=True,
+        )
+        if run_model is not model:
+            del run_model
+            maybe_empty_cache(device)
+    return results
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", required=True)
@@ -213,8 +355,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", default="results/suffix-beam-search.json")
     parser.add_argument("--beam-width", type=int, default=8)
     parser.add_argument("--replay-window", type=int, default=4)
-    parser.add_argument("--max-extra-layers", type=int, default=56)
+    parser.add_argument(
+        "--max-extra-layers",
+        type=int,
+        default=2,
+        help="Replay-layer budget. Increase only after proxy/exact correlation validation.",
+    )
     parser.add_argument("--dataset-limit", type=int, default=None)
+    parser.add_argument(
+        "--exact-dataset-offset",
+        type=int,
+        default=0,
+        help="Skip this many examples before selecting the exact-validation set.",
+    )
+    parser.add_argument(
+        "--exact-dataset-limit",
+        type=int,
+        default=None,
+        help="Exact-validation examples per benchmark; defaults to --dataset-limit.",
+    )
+    parser.add_argument(
+        "--exact-top-k",
+        type=int,
+        default=0,
+        help="After proxy search, generation-score the baseline and top N beam candidates.",
+    )
+    parser.add_argument("--exact-batch-size", type=int, default=1)
+    parser.add_argument("--math-max-new", type=int, default=64)
+    parser.add_argument("--eq-max-new", type=int, default=384)
     parser.add_argument(
         "--stop-after-layer",
         type=int,
@@ -243,6 +411,16 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max-extra-layers must be >= 0.")
     if args.dataset_limit is not None and args.dataset_limit < 1:
         raise ValueError("--dataset-limit must be >= 1.")
+    if args.exact_dataset_offset < 0:
+        raise ValueError("--exact-dataset-offset must be >= 0.")
+    if args.exact_dataset_limit is not None and args.exact_dataset_limit < 1:
+        raise ValueError("--exact-dataset-limit must be >= 1.")
+    if args.exact_top_k < 0:
+        raise ValueError("--exact-top-k must be >= 0.")
+    if args.exact_batch_size < 1:
+        raise ValueError("--exact-batch-size must be >= 1.")
+    if args.math_max_new < 1 or args.eq_max_new < 1:
+        raise ValueError("--math-max-new and --eq-max-new must be >= 1.")
 
 
 def main() -> None:
@@ -273,6 +451,7 @@ def main() -> None:
         final_layer = min(final_layer, args.stop_after_layer)
 
     beam = [BeamCandidate(layer_path=(), replays=())]
+    baseline_proxy_score: float | None = None
     started = time.monotonic()
     output_path = Path(args.output)
     for layer_idx in range(final_layer + 1):
@@ -295,6 +474,9 @@ def main() -> None:
             for child in children
         ]
         scored.sort(key=lambda candidate: float(candidate.score), reverse=True)
+        if layer_idx == 0:
+            baseline = next(candidate for candidate in scored if not candidate.replays)
+            baseline_proxy_score = float(baseline.score)
         beam = scored[: args.beam_width]
         elapsed = time.monotonic() - started
         best = beam[0]
@@ -312,6 +494,45 @@ def main() -> None:
             final_layer=final_layer,
             beam=beam,
             elapsed_seconds=elapsed,
+        )
+
+    if args.exact_top_k > 0:
+        if baseline_proxy_score is None:
+            raise RuntimeError("Baseline proxy score was not captured.")
+        exact_limit = args.exact_dataset_limit
+        if exact_limit is None:
+            exact_limit = args.dataset_limit
+        exact_math_raw = _load_dataset(
+            args.math_dataset_path,
+            exact_limit,
+            offset=args.exact_dataset_offset,
+        )
+        exact_eq_raw = _load_dataset(
+            args.eq_dataset_path,
+            exact_limit,
+            offset=args.exact_dataset_offset,
+        )
+        exact_results = run_exact_validation(
+            model=model,
+            tokenizer=tokenizer,
+            device=device,
+            math_dataset=exact_math_raw,
+            eq_dataset=exact_eq_raw,
+            baseline_proxy_score=baseline_proxy_score,
+            beam=beam,
+            last_layer=final_layer,
+            top_k=min(args.exact_top_k, len(beam)),
+            math_max_new=args.math_max_new,
+            eq_max_new=args.eq_max_new,
+            batch_size=args.exact_batch_size,
+        )
+        _write_exact_validation(
+            output_path,
+            exact_results,
+            math_max_new=args.math_max_new,
+            eq_max_new=args.eq_max_new,
+            batch_size=args.exact_batch_size,
+            dataset_offset=args.exact_dataset_offset,
         )
 
     print(f"Saved {len(beam)} candidates to {output_path}")

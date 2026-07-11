@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 import math
+from pathlib import Path
+import tempfile
 import unittest
 
 import torch
@@ -11,7 +14,14 @@ from transformers import (
     Qwen2ForCausalLM,
 )
 
-from scripts.beam_search import BeamCandidate, complete_layer_path, expand_beam, expand_candidate
+from scripts.beam_search import (
+    BeamCandidate,
+    _load_dataset,
+    _write_exact_validation,
+    complete_layer_path,
+    expand_beam,
+    expand_candidate,
+)
 from src.core.layer_duplicator import build_model_with_layers
 from src.workers.eq_worker import build_eq_first_pass_target, serialize_eq_first_pass_target
 from src.workers.math_worker import build_math_target, serialize_math_target
@@ -224,6 +234,52 @@ class SurrogateUtilsTests(unittest.TestCase):
                 (0, 1, 0, 1, 2, 2),
             ],
         )
+
+    def test_exact_validation_records_proxy_and_exact_rank_orders(self):
+        results = [
+            {
+                "label": "baseline",
+                "proxy_score": -3.0,
+                "score": 0.6,
+                "math_responses": [{}, {}],
+            },
+            {
+                "label": "beam_1",
+                "proxy_score": -2.0,
+                "score": 0.4,
+                "math_responses": [{}, {}],
+            },
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            output_path = Path(directory) / "result.json"
+            output_path.write_text('{"status": "proxy_complete"}\n')
+            _write_exact_validation(
+                output_path,
+                results,
+                math_max_new=64,
+                eq_max_new=384,
+                batch_size=1,
+                dataset_offset=2,
+            )
+            payload = json.loads(output_path.read_text())
+
+        validation = payload["exact_validation"]
+        self.assertEqual(payload["status"], "complete")
+        self.assertEqual(validation["proxy_order"], ["beam_1", "baseline"])
+        self.assertEqual(validation["exact_order"], ["baseline", "beam_1"])
+        self.assertFalse(validation["top_rank_agrees"])
+        self.assertEqual(validation["math_max_new"], 64)
+        self.assertEqual(validation["eq_max_new"], 384)
+        self.assertEqual(validation["dataset_offset"], 2)
+        self.assertEqual(validation["examples_per_benchmark"], 2)
+
+    def test_load_dataset_applies_offset_before_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            dataset_path = Path(directory) / "dataset.json"
+            dataset_path.write_text(json.dumps({"a": 1, "b": 2, "c": 3}) + "\n")
+            selected = _load_dataset(str(dataset_path), 1, offset=1)
+
+        self.assertEqual(selected, {"b": 2})
 
     def test_partial_runner_matches_full_forward_and_split_execution(self):
         model = self._tiny_llama()
