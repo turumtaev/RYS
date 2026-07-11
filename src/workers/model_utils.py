@@ -685,8 +685,26 @@ def score_teacher_forced_inputs(
             use_cache=False,
         )
 
-    token_logprobs = gather_target_token_logprobs(
+    return score_teacher_forced_logits(
         logits=outputs.logits,
+        input_ids=input_ids,
+        prompt_length=prompt_length,
+        target_mask=target_mask,
+        reduction=reduction,
+    )
+
+
+def score_teacher_forced_logits(
+    *,
+    logits: torch.Tensor,
+    input_ids: torch.Tensor,
+    prompt_length: int,
+    target_mask: torch.Tensor | None = None,
+    reduction: str = "mean",
+) -> dict[str, Any]:
+    """Score precomputed logits with the standard teacher-forced objective."""
+    token_logprobs = gather_target_token_logprobs(
+        logits=logits,
         input_ids=input_ids,
         prompt_length=prompt_length,
     )

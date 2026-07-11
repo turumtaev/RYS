@@ -80,7 +80,7 @@ For each beam candidate, generate children:
 
    choose `m` from a local window, for example:
 
-   `m in [max(0, k - W + 1), ..., k - 1]`
+   `m in [max(0, k - W + 1), ..., k]`
 
    and append replay block `(m, k + 1)`
 
@@ -90,6 +90,9 @@ Operationally this means:
 - feed its output back to layer `m`
 - rerun layers `m .. k`
 - then continue through suffix `k+1 .. N-1`
+
+Here `W` is the maximum replay-block length. The case `m = k` repeats only
+layer `k`; it is distinct from the plain child, which runs layer `k` once.
 
 Each beam candidate therefore produces:
 
@@ -153,7 +156,7 @@ This proxy is already implemented in this branch.
 
 ## 7. What The Current Branch Actually Implements
 
-This branch currently implements only the **supporting infrastructure** for the future suffix search:
+This branch implements the first correctness-first version of the suffix search.
 
 ### Implemented
 
@@ -162,25 +165,24 @@ This branch currently implements only the **supporting infrastructure** for the 
 - EQ numeric-token masking
 - uncached partial-layer execution for Llama/Qwen-style decoder stacks
 - arbitrary and repeated layer paths without rebuilding the model stack
+- boundary-by-boundary local replay expansion
+- uncached benchmark proxy ranking and beam pruning
 - Mac-compatible local environment
 - small local smoke validation
 
 ### Not implemented yet
 
-- boundary-by-boundary suffix beam search
-- replay-window candidate expansion over partial architectures
 - benchmark-side KV / activation reuse across children
-- a new suffix-search driver script
 - exact shortlist validation flow wired to the new search
 
-So we are **not** at "suffix search works".
-We are at "proxy scoring infra works and can be used to build suffix search".
+The uncached search has now completed a full tiny-model smoke run. Its ranking
+still needs validation on a larger benchmark subset and with exact generation.
 
 ## 8. Current Stage
 
 We are in:
 
-- `Stage D: uncached suffix-search driver`
+- `Stage F: correlation / shortlist validation`
 
 Status:
 
@@ -190,6 +192,8 @@ Status:
 - real Math and EQ smoke runs are passing
 - MPS is available in normal, unsandboxed execution
 - partial and repeated layer paths match Hugging Face full-model execution
+- the uncached suffix-search driver is implemented
+- a full 30-boundary tiny-model MPS smoke search completed successfully
 
 ## 9. Completed Work
 
@@ -314,15 +318,12 @@ also matches exactly on MPS for both normal and repeated paths.
 
 ### Stage D. Add suffix search driver
 
-Status: pending
+Status: done
 
-Build the real algorithm as a separate path, not by replacing the current `scripts/beam_search.py` immediately.
+The branch version of `scripts/beam_search.py` now implements the new algorithm.
+The baseline branch retains the author's original search.
 
-Suggested script:
-
-- `scripts/benchmark_suffix_beam_search.py`
-
-Suggested responsibilities:
+Responsibilities:
 
 1. initialize beam from baseline prefix
 2. expand children at boundary `k`
@@ -334,7 +335,7 @@ Suggested responsibilities:
 
 ### Stage E. Small end-to-end search smoke
 
-Status: pending
+Status: done
 
 Goal:
 
@@ -347,7 +348,18 @@ Purpose:
 
 - validate orchestration
 - validate output files
-- validate resume behavior
+
+Observed result with one Math and one EQ example:
+
+- model: `HuggingFaceTB/SmolLM2-135M-Instruct`
+- beam width: `2`
+- replay window: `2`
+- baseline proxy: `-2.770594`
+- best final proxy: `-2.283013`
+- search time on MPS: `23.3s`
+
+This result proves the mechanics, not benchmark quality. Two examples are far
+too few to judge whether the selected replay configuration generalizes.
 
 ### Stage F. Correlation / shortlist validation
 
@@ -376,13 +388,10 @@ Only start after:
 
 In order:
 
-1. Implement boundary expansion logic for:
-   - plain child
-   - replay child `(m, k+1)` in a limited window
-2. Build a minimal uncached suffix-search driver using the current proxy scorer.
-3. Run a tiny end-to-end search with beam width `2`, replay window `2`, and one or two examples.
-4. Add chunked benchmark evaluation.
-5. Profile recomputation versus CPU-stored boundary states before adding cache complexity.
+1. Run the search on a larger local subset and compare proxy rankings with exact generation.
+2. Add chunked benchmark evaluation.
+3. Profile recomputation versus CPU-stored boundary states before adding cache complexity.
+4. Wire exact generation-based shortlist validation into the driver.
 
 ## 13. Commands We Can Reuse
 
@@ -415,7 +424,20 @@ HF_HOME=.hf-cache .venv/bin/python -m src.workers.math_worker \
   --no-trust-remote-code
 ```
 
+### Full tiny suffix-search smoke
+
+```bash
+HF_HOME=.hf-cache .venv/bin/python scripts/beam_search.py \
+  --model-path HuggingFaceTB/SmolLM2-135M-Instruct \
+  --device-map mps \
+  --torch-dtype float32 \
+  --dataset-limit 1 \
+  --beam-width 2 \
+  --replay-window 2 \
+  --output results/mac_smoke/suffix_beam_search_full.json
+```
+
 ## 14. Branches
 
 - `main`: baseline public repo behavior
-- `codex_proxy_search`: proxy infra and future suffix-search work
+- `codex_proxy_search`: proxy scoring and suffix-search implementation

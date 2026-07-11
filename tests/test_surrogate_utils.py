@@ -11,6 +11,7 @@ from transformers import (
     Qwen2ForCausalLM,
 )
 
+from scripts.beam_search import BeamCandidate, complete_layer_path, expand_beam, expand_candidate
 from src.core.layer_duplicator import build_model_with_layers
 from src.workers.eq_worker import build_eq_first_pass_target, serialize_eq_first_pass_target
 from src.workers.math_worker import build_math_target, serialize_math_target
@@ -18,6 +19,8 @@ from src.workers.model_utils import (
     LlamaLikePartialRunner,
     gather_target_token_logprobs,
     reduce_logprobs,
+    score_teacher_forced_inputs,
+    score_teacher_forced_logits,
 )
 from src.utils.surrogate_utils import (
     count_vector_to_layers,
@@ -151,6 +154,75 @@ class SurrogateUtilsTests(unittest.TestCase):
                 expected_second,
                 rel_tol=1e-6,
             )
+        )
+
+    def test_teacher_forced_precomputed_logits_match_model_scoring(self):
+        model = self._tiny_llama()
+        input_ids = torch.tensor([[1, 2, 3, 4]])
+        attention_mask = torch.ones_like(input_ids)
+        target_mask = torch.tensor([[True, False]])
+
+        expected = score_teacher_forced_inputs(
+            model=model,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            prompt_length=2,
+            target_mask=target_mask,
+        )
+        with torch.no_grad():
+            logits = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
+        actual = score_teacher_forced_logits(
+            logits=logits,
+            input_ids=input_ids,
+            prompt_length=2,
+            target_mask=target_mask,
+        )
+
+        self.assertEqual(actual, expected)
+
+    def test_suffix_beam_expands_plain_and_local_replay_paths(self):
+        candidate = BeamCandidate(layer_path=(0, 1), replays=())
+        children = expand_candidate(
+            candidate,
+            layer_idx=2,
+            replay_window=2,
+            num_layers=5,
+        )
+
+        self.assertEqual(
+            [child.layer_path for child in children],
+            [
+                (0, 1, 2),
+                (0, 1, 2, 1, 2),
+                (0, 1, 2, 2),
+            ],
+        )
+        self.assertEqual(
+            [child.replays for child in children],
+            [(), ((1, 3),), ((2, 3),)],
+        )
+        self.assertEqual(
+            complete_layer_path(children[-1], layer_idx=2, num_layers=5),
+            (0, 1, 2, 2, 3, 4),
+        )
+
+    def test_suffix_beam_respects_extra_layer_cap(self):
+        candidate = BeamCandidate(layer_path=(0, 1, 0, 1), replays=((0, 2),))
+        children = expand_beam(
+            [candidate],
+            layer_idx=2,
+            replay_window=2,
+            num_layers=4,
+            max_extra_layers=4,
+        )
+
+        self.assertEqual(
+            [child.layer_path for child in children],
+            [
+                (0, 1, 0, 1, 2),
+                (0, 1, 0, 1, 2, 1, 2),
+                (0, 1, 0, 1, 2, 2),
+            ],
         )
 
     def test_partial_runner_matches_full_forward_and_split_execution(self):
