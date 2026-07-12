@@ -33,6 +33,8 @@ from src.workers.eq_worker import build_eq_first_pass_target, serialize_eq_first
 from src.workers.math_worker import build_math_target, serialize_math_target
 from src.workers.model_utils import (
     LlamaLikePartialRunner,
+    build_teacher_forced_inputs,
+    expand_mask_islands_right,
     gather_target_token_logprobs,
     reduce_logprobs,
     score_teacher_forced_inputs,
@@ -170,6 +172,56 @@ class SurrogateUtilsTests(unittest.TestCase):
                 expected_second,
                 rel_tol=1e-6,
             )
+        )
+
+    def test_expand_mask_islands_scores_each_following_token(self):
+        mask = torch.tensor(
+            [[False, True, True, True, False, False, True, True, False]]
+        )
+
+        expanded = expand_mask_islands_right(mask)
+
+        self.assertEqual(
+            expanded.tolist(),
+            [[False, True, True, True, True, False, True, True, True]],
+        )
+        self.assertEqual(mask.tolist(), [[False, True, True, True, False, False, True, True, False]])
+
+    def test_teacher_forced_inputs_append_and_score_answer_terminators(self):
+        class CharacterTokenizer:
+            eos_token_id = 99
+
+            def __call__(
+                self,
+                text,
+                *,
+                return_tensors,
+                add_special_tokens,
+                return_offsets_mapping=False,
+            ):
+                del return_tensors, add_special_tokens
+                result = {
+                    "input_ids": torch.tensor([[ord(char) % 90 for char in text]]),
+                    "attention_mask": torch.ones((1, len(text)), dtype=torch.long),
+                }
+                if return_offsets_mapping:
+                    result["offset_mapping"] = torch.tensor(
+                        [[[idx, idx + 1] for idx in range(len(text))]]
+                    )
+                return result
+
+        inputs = build_teacher_forced_inputs(
+            CharacterTokenizer(),
+            prompt_text="ab",
+            target_text="12\nx3",
+            target_char_spans=[(0, 2), (4, 5)],
+        )
+
+        self.assertEqual(inputs.input_ids[0, -1].item(), 99)
+        self.assertEqual(inputs.target_length, 6)
+        self.assertEqual(
+            inputs.target_mask.tolist(),
+            [[True, True, True, False, True, True]],
         )
 
     def test_teacher_forced_precomputed_logits_match_model_scoring(self):

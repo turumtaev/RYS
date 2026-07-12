@@ -555,6 +555,22 @@ def _move_tensor_batch(
     return {k: v.to(device) for k, v in batch.items()}
 
 
+def expand_mask_islands_right(mask: torch.Tensor) -> torch.Tensor:
+    """Include the token immediately following every contiguous true region."""
+    if mask.ndim != 2:
+        raise ValueError("Mask must have shape [batch, target_tokens].")
+    if mask.dtype != torch.bool:
+        raise ValueError("Mask must use boolean dtype.")
+    if mask.shape[1] < 2:
+        return mask.clone()
+
+    original = mask
+    island_ends = original[:, :-1] & ~original[:, 1:]
+    expanded = original.clone()
+    expanded[:, 1:] |= island_ends
+    return expanded
+
+
 def build_teacher_forced_inputs(
     tokenizer: Any,
     *,
@@ -564,7 +580,7 @@ def build_teacher_forced_inputs(
     device: torch.device | str | None = None,
     add_special_tokens: bool = True,
 ) -> TeacherForcedInputs:
-    """Tokenize a prompt/target pair for teacher-forced scoring."""
+    """Tokenize a prompt/target pair and score target termination with EOS."""
     prompt_batch = tokenizer(prompt_text, return_tensors="pt", add_special_tokens=add_special_tokens)
     full_tokenizer_kwargs: dict[str, Any] = {
         "return_tensors": "pt",
@@ -612,6 +628,33 @@ def build_teacher_forced_inputs(
                 row_mask.append(is_scored)
             mask_rows.append(row_mask)
         target_mask = torch.tensor(mask_rows, dtype=torch.bool)
+
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    if eos_token_id is None:
+        raise ValueError("Teacher-forced scoring requires a tokenizer eos_token_id.")
+    eos_ids = torch.full(
+        (full_ids.shape[0], 1),
+        int(eos_token_id),
+        dtype=full_ids.dtype,
+    )
+    full_batch["input_ids"] = torch.cat((full_ids, eos_ids), dim=1)
+    full_batch["attention_mask"] = torch.cat(
+        (
+            full_batch["attention_mask"],
+            torch.ones((full_ids.shape[0], 1), dtype=full_batch["attention_mask"].dtype),
+        ),
+        dim=1,
+    )
+    full_len += 1
+    if target_mask is not None:
+        target_mask = torch.cat(
+            (
+                target_mask,
+                torch.zeros((target_mask.shape[0], 1), dtype=torch.bool),
+            ),
+            dim=1,
+        )
+        target_mask = expand_mask_islands_right(target_mask)
 
     full_batch = _move_tensor_batch(
         {k: v for k, v in full_batch.items() if k != "offset_mapping"},

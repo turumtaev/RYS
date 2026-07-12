@@ -148,9 +148,25 @@ So the practical plan is:
 
 Current proxy choice:
 
-- Math: teacher-forced log-probability of the canonical correct integer answer
+- Math: teacher-forced log-probability of the canonical correct integer answer and EOS
 - EQ: teacher-forced log-probability of the canonical first-pass score block
-- EQ masking: score only the numeric tokens, not the emotion labels
+- EQ masking: score each numeric token island plus its following delimiter or EOS
+
+The terminator tokens are important: they reward assigning probability to a
+complete answer rather than to the correct numeric prefix followed by more digits.
+
+Qwen2.5-0.5B validation after adding terminators:
+
+- Math target scores every answer token plus `<|im_end|>`
+- EQ scores each numeric token plus newline, with `<|im_end|>` after the final score
+- uncapped two-example baseline exact combined score: `0.462018`
+- top termination-aware proxy candidate exact combined score: `0.485587`
+- proxy and exact top rank agree
+- the previous repeated giant-integer generation collapse was not observed
+
+Before termination scoring, the comparable uncapped proxy winner scored about
+`0.364` exactly and repeatedly generated extremely long integers. This supports
+including answer termination in the search objective.
 
 This proxy is already implemented in this branch.
 
@@ -210,7 +226,8 @@ Status:
 - EQ worker supports teacher-forced proxy scoring
 - proxy score is target-token log-probability
 - Math scores all answer tokens
-- EQ scores only numeric answer tokens
+- Math also scores the final EOS token
+- EQ scores numeric answer tokens plus the following newline or EOS token
 
 ### B. Mac local execution path
 
@@ -519,9 +536,11 @@ Validation:
 
 In order:
 
-1. Preserve lower-budget candidates so a small replay budget does not get spent only in early layers.
-2. Sweep larger replay budgets with exact held-out validation.
-3. Profile the cached implementation on the intended GPU/model combination.
+1. Add padding-aware batched proxy scoring with full-sequence score masks.
+2. Preserve lower-budget candidates so a small replay budget does not get spent only in early layers.
+3. Tune the current global-beam hyperparameters on a validation split.
+4. Compare global and budget-indexed beams at matched compute.
+5. Profile the cached implementation on the intended GPU/model combination.
 
 ## 13. Commands We Can Reuse
 
