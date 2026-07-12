@@ -483,6 +483,32 @@ Batching did not help this MPS workload because EQ padding and large vocabulary
 logits outweighed launch savings. The automatic default is therefore batch 1
 for CPU/MPS and batch 8 for CUDA. CUDA batch size still needs profiling.
 
+### Global-beam hyperparameter baseline
+
+Status: small local tuning pass complete
+
+Setup:
+
+- model: `Qwen/Qwen2.5-0.5B-Instruct`
+- proxy search: first four Math and EQ examples
+- exact validation: next four Math and EQ examples
+- termination-aware objective
+
+Results:
+
+| Beam | Window | Budget | Search | Best exact |
+|---:|---:|---:|---:|---:|
+| 2 | 1 | 2 | `45.2s` | `0.509368` |
+| 2 | 2 | 2 | `47.4s` | `0.509368` |
+| 4 | 2 | 2 | `86.6s` | `0.509368` |
+| 2 | 2 | 4 | `74.6s` | `0.490254` |
+
+The current global-beam baseline is therefore beam width `2`, replay window
+`1`, and replay budget `2`. Wider search improved proxy scores but not held-out
+exact quality. This is a deliberately small, noisy tuning pass; it selects a
+reasonable baseline for testing budget-indexed beams, not final production
+hyperparameters.
+
 ### CPU activation-cache profile
 
 Status: implemented and validated
@@ -551,11 +577,10 @@ Validation:
 
 In order:
 
-1. Tune the current global-beam hyperparameters on a validation split.
-2. Implement budget-indexed beams that preserve candidates at each replay budget.
-3. Compare global and budget-indexed beams at matched compute.
-4. Tune the budget-indexed method only if it shows value.
-5. Profile CUDA batch size and the cached implementation on the intended GPU/model combination.
+1. Implement budget-indexed beams using the selected global baseline.
+2. Compare global and budget-indexed beams at matched compute.
+3. Tune the budget-indexed method only if it shows value.
+4. Profile CUDA batch size and the cached implementation on the intended GPU/model combination.
 
 ## 13. Commands We Can Reuse
 
