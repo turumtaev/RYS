@@ -200,7 +200,7 @@ Status:
 - the cached suffix-search driver is implemented
 - exact shortlist and held-out validation are implemented
 - a full 30-boundary tiny-model MPS smoke search completed successfully
-- a full 24-boundary Qwen search completed on all 16+16 benchmark examples
+- a full 24-boundary Qwen search completed on both 16-example smoke subsets
 
 ## 9. Completed Work
 
@@ -463,13 +463,22 @@ Qwen2.5-0.5B, float16, boundary 12, four Math plus four EQ examples:
 - recomputation / reload ratio: about `283x`
 - eight-example cache size: `6.19 MiB` per candidate boundary
 
-Full 16+16 benchmark footprint:
+Combined 16+16 smoke-subset footprint:
 
 - total teacher-forced tokens: `14,598`
 - cache per candidate boundary: `24.95 MiB`
 - beam 8: about `200 MiB`
 - beam 12: about `299 MiB`
 - beam 24: about `599 MiB`
+
+Larger `math_120.json` plus `eq_140.json` footprint (`120 + 139` examples):
+
+- total teacher-forced tokens: `65,905`
+- cache per candidate boundary: `112.63 MiB`
+- beam 2: about `225 MiB`
+- beam 8: about `901 MiB`
+- beam 12: about `1.35 GiB`
+- beam 24: about `2.70 GiB`
 
 CPU RAM and transfer speed are sufficient on the Mac. The implementation uses
 two passes at each boundary:
@@ -502,7 +511,9 @@ Validation:
 - Qwen MPS scores and beam paths are bit-identical to uncached runs
 - capped two-example search: `30.5s` uncached, `21.9s` cached (`1.39x`)
 - continuously branching search: `87.3s` uncached, `52.7s` cached (`1.66x`)
-- full 16+16 benchmark completed all 24 boundaries with a stable `49.9 MiB` cache
+- both 16-example smoke subsets completed all 24 boundaries with a stable `49.9 MiB` cache
+- all 120 Math plus 139 EQ examples completed a two-boundary cache restore smoke
+- large-dataset peak cache matched the estimate at `225.3 MiB` for beam width 2
 
 ## 12. Immediate Next Tasks
 
