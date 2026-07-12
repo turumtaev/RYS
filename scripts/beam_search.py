@@ -577,6 +577,41 @@ def boundary_cache_bytes(cache: BoundaryCache) -> int:
     )
 
 
+def candidate_replay_budget(candidate: BeamCandidate, *, layer_idx: int) -> int:
+    """Return extra executed layers in a partial path through ``layer_idx``."""
+    budget = len(candidate.layer_path) - (layer_idx + 1)
+    if budget < 0:
+        raise ValueError("Candidate path does not reach the requested boundary.")
+    return budget
+
+
+def select_budget_indexed_beams(
+    candidates: Iterable[BeamCandidate],
+    *,
+    layer_idx: int,
+    beam_width: int,
+    max_extra_layers: int,
+) -> dict[int, list[BeamCandidate]]:
+    """Keep an independent top beam for every exact replay-layer budget."""
+    grouped: dict[int, list[BeamCandidate]] = {}
+    for candidate in candidates:
+        budget = candidate_replay_budget(candidate, layer_idx=layer_idx)
+        if budget <= max_extra_layers:
+            grouped.setdefault(budget, []).append(candidate)
+    for budget_candidates in grouped.values():
+        budget_candidates.sort(key=lambda candidate: float(candidate.score), reverse=True)
+        del budget_candidates[beam_width:]
+    return dict(sorted(grouped.items()))
+
+
+def flatten_budget_beams(
+    beam_by_budget: dict[int, list[BeamCandidate]],
+) -> list[BeamCandidate]:
+    candidates = [candidate for beam in beam_by_budget.values() for candidate in beam]
+    candidates.sort(key=lambda candidate: float(candidate.score), reverse=True)
+    return candidates
+
+
 def _candidate_json(candidate: BeamCandidate, *, layer_idx: int, num_layers: int) -> dict[str, Any]:
     data = asdict(candidate)
     data["layer_path"] = list(candidate.layer_path)
@@ -594,7 +629,7 @@ def _write_progress(
     model_metadata: dict[str, Any],
     layer_idx: int,
     final_layer: int,
-    beam: list[BeamCandidate],
+    beam_by_budget: dict[int, list[BeamCandidate]],
     elapsed_seconds: float,
     boundary_cache_size: int,
     peak_boundary_cache_size: int,
@@ -604,13 +639,14 @@ def _write_progress(
     status = "running"
     if finished_proxy_search:
         status = "proxy_complete" if args.exact_top_k > 0 else "complete"
+    beam = flatten_budget_beams(beam_by_budget)
     payload = {
-        "algorithm": "benchmark_conditioned_suffix_beam_search",
+        "algorithm": "budget_indexed_benchmark_suffix_beam_search",
         "status": status,
         "full_model_search": final_layer == model_metadata["num_layers"] - 1,
         "model": model_metadata,
         "search": {
-            "beam_width": args.beam_width,
+            "beam_width_per_budget": args.beam_width,
             "replay_window": args.replay_window,
             "max_extra_layers": args.max_extra_layers,
             "dataset_limit_per_benchmark": args.dataset_limit,
@@ -627,6 +663,17 @@ def _write_progress(
             _candidate_json(candidate, layer_idx=layer_idx, num_layers=model_metadata["num_layers"])
             for candidate in beam
         ],
+        "beam_by_budget": {
+            str(budget): [
+                _candidate_json(
+                    candidate,
+                    layer_idx=layer_idx,
+                    num_layers=model_metadata["num_layers"],
+                )
+                for candidate in budget_beam
+            ]
+            for budget, budget_beam in beam_by_budget.items()
+        },
     }
     temporary = output_path.with_suffix(output_path.suffix + ".tmp")
     temporary.write_text(json.dumps(payload, indent=2) + "\n")
@@ -735,6 +782,7 @@ def run_exact_validation(
             "label": label,
             "layer_path": list(layer_path),
             "replays": [list(block) for block in replays],
+            "replay_budget": len(layer_path) - num_layers,
             "proxy_score": float(proxy_score),
             "math_score": math_score,
             "eq_score": eq_score,
@@ -762,7 +810,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--math-dataset-path", default="datasets/math_16.json")
     parser.add_argument("--eq-dataset-path", default="datasets/eq_16.json")
     parser.add_argument("--output", default="results/suffix-beam-search.json")
-    parser.add_argument("--beam-width", type=int, default=8)
+    parser.add_argument(
+        "--beam-width",
+        type=int,
+        default=2,
+        help="Candidates retained independently in each replay-budget cell.",
+    )
     parser.add_argument("--replay-window", type=int, default=4)
     parser.add_argument(
         "--max-extra-layers",
@@ -874,15 +927,20 @@ def main() -> None:
             raise ValueError("--stop-after-layer must be >= 0.")
         final_layer = min(final_layer, args.stop_after_layer)
 
-    beam = [BeamCandidate(layer_path=(), replays=())]
+    beam_by_budget = {0: [BeamCandidate(layer_path=(), replays=())]}
     parent_cache: BoundaryCache = {}
     baseline_proxy_score: float | None = None
     peak_boundary_cache_size = 0
     started = time.monotonic()
     output_path = Path(args.output)
     for layer_idx in range(final_layer + 1):
+        parents = [
+            candidate
+            for budget_beam in beam_by_budget.values()
+            for candidate in budget_beam
+        ]
         expansions = expand_beam_with_parents(
-            beam,
+            parents,
             layer_idx=layer_idx,
             replay_window=args.replay_window,
             num_layers=runner.num_layers,
@@ -900,11 +958,16 @@ def main() -> None:
             batch_size=args.benchmark_batch_size,
             pad_token_id=pad_token_id,
         )
-        scored.sort(key=lambda candidate: float(candidate.score), reverse=True)
         if layer_idx == 0:
             baseline = next(candidate for candidate in scored if not candidate.replays)
             baseline_proxy_score = float(baseline.score)
-        beam = scored[: args.beam_width]
+        beam_by_budget = select_budget_indexed_beams(
+            scored,
+            layer_idx=layer_idx,
+            beam_width=args.beam_width,
+            max_extra_layers=args.max_extra_layers,
+        )
+        beam = flatten_budget_beams(beam_by_budget)
         boundary_cache_size = 0
         if layer_idx < final_layer:
             expansion_by_path = {
@@ -933,6 +996,7 @@ def main() -> None:
         best = beam[0]
         print(
             f"layer={layer_idx} children={len(expansions)} "
+            f"budgets={{{', '.join(f'{budget}:{len(items)}' for budget, items in beam_by_budget.items())}}} "
             f"best={best.score:.6f} math={best.math_score:.6f} "
             f"eq={best.eq_score:.6f} replays={best.replays} "
             f"cache={boundary_cache_size / 2**20:.1f}MiB elapsed={elapsed:.1f}s",
@@ -944,12 +1008,13 @@ def main() -> None:
             model_metadata=metadata,
             layer_idx=layer_idx,
             final_layer=final_layer,
-            beam=beam,
+            beam_by_budget=beam_by_budget,
             elapsed_seconds=elapsed,
             boundary_cache_size=boundary_cache_size,
             peak_boundary_cache_size=peak_boundary_cache_size,
         )
 
+    beam = flatten_budget_beams(beam_by_budget)
     if args.exact_top_k > 0:
         if baseline_proxy_score is None:
             raise RuntimeError("Baseline proxy score was not captured.")

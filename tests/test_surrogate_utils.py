@@ -21,6 +21,7 @@ from scripts.beam_search import (
     _load_dataset,
     _write_exact_validation,
     boundary_cache_bytes,
+    candidate_replay_budget,
     complete_layer_path,
     expand_beam,
     expand_beam_with_parents,
@@ -28,6 +29,7 @@ from scripts.beam_search import (
     materialize_boundary_cache,
     score_cached_expansions,
     score_candidates,
+    select_budget_indexed_beams,
 )
 from src.core.layer_duplicator import build_model_with_layers
 from src.workers.eq_worker import build_eq_first_pass_target, serialize_eq_first_pass_target
@@ -292,6 +294,53 @@ class SurrogateUtilsTests(unittest.TestCase):
                 (0, 1, 0, 1, 2, 1, 2),
                 (0, 1, 0, 1, 2, 2),
             ],
+        )
+
+    def test_budget_indexed_beam_retains_each_exact_budget(self):
+        candidates = [
+            BeamCandidate((0, 1, 2), (), score=-3.0),
+            BeamCandidate((0, 1, 2, 2), ((2, 3),), score=-2.0),
+            BeamCandidate((0, 1, 1, 2), ((1, 2),), score=-1.5),
+            BeamCandidate((0, 1, 2, 1, 2), ((1, 3),), score=-1.0),
+        ]
+
+        beams = select_budget_indexed_beams(
+            candidates,
+            layer_idx=2,
+            beam_width=1,
+            max_extra_layers=2,
+        )
+
+        self.assertEqual(list(beams), [0, 1, 2])
+        self.assertEqual(beams[0][0].layer_path, (0, 1, 2))
+        self.assertEqual(beams[1][0].layer_path, (0, 1, 1, 2))
+        self.assertEqual(beams[2][0].layer_path, (0, 1, 2, 1, 2))
+
+    def test_budgeted_expansion_transitions_from_previous_boundary(self):
+        parents = [
+            BeamCandidate((0, 1), (), score=-2.0),
+            BeamCandidate((0, 1, 1), ((1, 2),), score=-1.0),
+        ]
+        expansions = expand_beam_with_parents(
+            parents,
+            layer_idx=2,
+            replay_window=2,
+            num_layers=4,
+            max_extra_layers=2,
+        )
+
+        budgets = {
+            candidate_replay_budget(expansion.child, layer_idx=2)
+            for expansion in expansions
+        }
+        self.assertEqual(budgets, {0, 1, 2})
+        self.assertTrue(
+            any(
+                expansion.parent_path == (0, 1)
+                and expansion.replay_start == 1
+                and candidate_replay_budget(expansion.child, layer_idx=2) == 2
+                for expansion in expansions
+            )
         )
 
     def test_exact_validation_records_proxy_and_exact_rank_orders(self):

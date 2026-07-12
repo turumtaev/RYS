@@ -187,23 +187,23 @@ This branch implements the first correctness-first version of the suffix search.
 - prefix reuse across child expansions
 - exact generation-based shortlist validation
 - held-out validation dataset selection
+- budget-indexed beams with independent pruning per replay-layer budget
 - Mac-compatible local environment
 - small local smoke validation
 
 ### Not implemented yet
 
-- replay-budget-diverse beam retention
+- budget-indexed hyperparameter tuning
 - intended large-model GPU validation
 
-The cached search now runs end to end and matches full-prefix recomputation.
-The next search-quality issue is preventing every beam candidate from spending
-a small replay budget only in early layers.
+The cached budget-indexed search now runs end to end and preserves candidates
+that spend their replay budget at later boundaries.
 
 ## 8. Current Stage
 
 We are in:
 
-- `Search-quality refinement: replay-budget diversity`
+- `Search-quality refinement: budget-indexed tuning`
 
 Status:
 
@@ -509,6 +509,35 @@ exact quality. This is a deliberately small, noisy tuning pass; it selects a
 reasonable baseline for testing budget-indexed beams, not final production
 hyperparameters.
 
+### Budget-indexed beam comparison
+
+Status: implementation and first comparison complete
+
+The search now keeps an independent beam for every exact replay-layer budget.
+At boundary `k`, budget `i` receives:
+
+- a plain child from budget `i`
+- a replay of length `L` from budget `i-L`
+
+Using window `1` and maximum budget `2`:
+
+| Method | Width | Search | Best exact |
+|---|---:|---:|---:|
+| Global | 2 total | `45.2s` | `0.509368` |
+| Global | 4 total | `86.6s` | `0.509368` |
+| Budget-indexed | 1 per budget | `89.3s` | `0.461896` |
+| Budget-indexed | 2 per budget | `135.9s` | **`0.547777`** |
+
+Budget-indexed width 2 found the later-layer configuration `(4,5);(11,12)`,
+which improved held-out Math enough to beat the global baseline. Its best exact
+candidate was second by proxy within budget 2, so exact shortlist validation
+remains necessary.
+
+At approximately matched local runtime, global width 4 beat budget-indexed
+width 1. Budget indexing therefore improved maximum observed quality, not
+compute efficiency. Because it showed a quality gain, a small budget-indexed
+hyperparameter pass is justified next.
+
 ### CPU activation-cache profile
 
 Status: implemented and validated
@@ -542,11 +571,13 @@ CPU RAM and transfer speed are sufficient on the Mac. The implementation uses
 two passes at each boundary:
 
 1. score all children from cached parent states without retaining every child
-2. prune globally, then recompute only the top children's short local expansion
+2. prune independently within each budget, then recompute only the surviving
+   children's short local expansion
    and offload those boundary states for the next step
 
-This keeps resident CPU cache proportional to the beam width instead of the
-full branching factor `C * (1 + W)`.
+This keeps resident CPU cache proportional to the retained candidates instead
+of the full branching factor. Budget-indexed search retains up to
+`1 + max_budget * beam_width` candidates because budget 0 has only the baseline.
 
 Implemented candidate state:
 
@@ -560,7 +591,7 @@ At boundary `k`, scoring now:
 2. runs layer `k` once per parent
 3. creates plain and replay children from that state
 4. runs only suffix `k+1 .. N-1` for proxy scoring
-5. prunes globally
+5. prunes independently inside each replay-budget cell
 6. reruns only the winners' short local expansion and offloads their new states
 
 Validation:
@@ -577,10 +608,9 @@ Validation:
 
 In order:
 
-1. Implement budget-indexed beams using the selected global baseline.
-2. Compare global and budget-indexed beams at matched compute.
-3. Tune the budget-indexed method only if it shows value.
-4. Profile CUDA batch size and the cached implementation on the intended GPU/model combination.
+1. Run a small budget-indexed hyperparameter pass.
+2. Confirm the selected configuration on a held-out test split not used for tuning.
+3. Profile CUDA batch size and the cached implementation on the intended GPU/model combination.
 
 ## 13. Commands We Can Reuse
 
