@@ -538,6 +538,31 @@ width 1. Budget indexing therefore improved maximum observed quality, not
 compute efficiency. Because it showed a quality gain, a small budget-indexed
 hyperparameter pass is justified next.
 
+### Budget-indexed hyperparameter pass
+
+Status: small local tuning pass complete
+
+The pass kept width `2` per budget and varied one parameter at a time from the
+initial budget-indexed result:
+
+| Width | Window | Budget | Search | Peak cache | Best exact |
+|---:|---:|---:|---:|---:|---:|
+| 2 | 1 | 2 | `135.9s` | `31.0 MiB` | `0.547777` |
+| 2 | 2 | 2 | `153.5s` | `31.0 MiB` | `0.547777` |
+| 2 | 1 | 4 | `243.2s` | `55.8 MiB` | **`0.605051`** |
+
+Window `2` retained the same best configurations as window `1` and only added
+search cost. Budget `4` found two useful three-layer configurations. The best
+held-out exact candidate replayed `(7,8);(11,12);(15,16)` and scored
+`0.605051`; it ranked fourth by proxy, which reinforces the need to validate a
+shortlist rather than only the proxy winner.
+
+The selected local configuration is therefore width `2` per budget, replay
+window `1`, and maximum replay budget `4`. This selection used the first four
+examples for proxy search and the next four for exact validation, so it must be
+confirmed on a fresh test split before treating the improvement as evidence of
+generalization.
+
 ### CPU activation-cache profile
 
 Status: implemented and validated
@@ -608,9 +633,8 @@ Validation:
 
 In order:
 
-1. Run a small budget-indexed hyperparameter pass.
-2. Confirm the selected configuration on a held-out test split not used for tuning.
-3. Profile CUDA batch size and the cached implementation on the intended GPU/model combination.
+1. Confirm the selected budget-indexed configuration on a held-out test split not used for tuning.
+2. Profile CUDA batch size and the cached implementation on the intended GPU/model combination.
 
 ## 13. Commands We Can Reuse
 
