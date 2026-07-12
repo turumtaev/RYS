@@ -64,6 +64,15 @@ ExampleKey = tuple[str, str]
 BoundaryCache = dict[tuple[int, ...], dict[ExampleKey, torch.Tensor]]
 
 
+@dataclass(frozen=True)
+class ProxyBatch:
+    qids: tuple[str, ...]
+    input_ids: torch.Tensor
+    attention_mask: torch.Tensor
+    score_mask: torch.Tensor
+    sequence_lengths: tuple[int, ...]
+
+
 def expand_candidate(
     candidate: BeamCandidate,
     *,
@@ -198,13 +207,16 @@ def _dataset_chunks(
         yield values[start : start + chunk_size]
 
 
-def _dataset_item_chunks(
+def _dataset_item_batches(
     dataset: dict[str, dict[str, Any]],
-    chunk_size: int,
+    batch_size: int,
 ) -> Iterable[list[tuple[str, dict[str, Any]]]]:
-    items = list(dataset.items())
-    for start in range(0, len(items), chunk_size):
-        yield items[start : start + chunk_size]
+    items = sorted(
+        dataset.items(),
+        key=lambda item: int(item[1]["input_ids"].shape[1]),
+    )
+    for start in range(0, len(items), batch_size):
+        yield items[start : start + batch_size]
 
 
 def _move_cached_example(cached: dict[str, Any], device: torch.device) -> dict[str, Any]:
@@ -212,6 +224,87 @@ def _move_cached_example(cached: dict[str, Any], device: torch.device) -> dict[s
         key: value.to(device) if isinstance(value, torch.Tensor) else value
         for key, value in cached.items()
     }
+
+
+def _collate_proxy_batch(
+    items: list[tuple[str, dict[str, Any]]],
+    *,
+    device: torch.device,
+    pad_token_id: int,
+) -> ProxyBatch:
+    """Right-pad pretokenized examples and build a full-sequence score mask."""
+    if not items:
+        raise ValueError("Cannot collate an empty proxy batch.")
+    sequence_lengths = tuple(int(cached["input_ids"].shape[1]) for _, cached in items)
+    max_length = max(sequence_lengths)
+    input_dtype = items[0][1]["input_ids"].dtype
+    attention_dtype = items[0][1]["attention_mask"].dtype
+    input_ids = torch.full(
+        (len(items), max_length),
+        pad_token_id,
+        dtype=input_dtype,
+        device=device,
+    )
+    attention_mask = torch.zeros(
+        (len(items), max_length),
+        dtype=attention_dtype,
+        device=device,
+    )
+    score_mask = torch.zeros(
+        (len(items), max_length),
+        dtype=torch.bool,
+        device=device,
+    )
+
+    for row, (_, cached) in enumerate(items):
+        length = sequence_lengths[row]
+        ids = cached["input_ids"][0].to(device)
+        attention = cached["attention_mask"][0].to(device)
+        input_ids[row, :length] = ids
+        attention_mask[row, :length] = attention
+        prompt_length = int(cached["prompt_length"])
+        target_mask = cached.get("target_mask")
+        if target_mask is None:
+            score_mask[row, prompt_length:length] = True
+        else:
+            target_mask = target_mask[0].to(device)
+            if prompt_length + target_mask.numel() != length:
+                raise ValueError("prompt_length + target_mask length must equal sequence length.")
+            score_mask[row, prompt_length:length] = target_mask
+
+    return ProxyBatch(
+        qids=tuple(qid for qid, _ in items),
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        score_mask=score_mask,
+        sequence_lengths=sequence_lengths,
+    )
+
+
+def _score_proxy_batch_logits(
+    *,
+    logits: torch.Tensor,
+    batch: ProxyBatch,
+    reduction: str,
+) -> list[float]:
+    """Reduce shifted token log-probabilities independently per example."""
+    labels = batch.input_ids[:, 1:]
+    token_logprobs = torch.log_softmax(logits[:, :-1, :], dim=-1).gather(
+        -1,
+        labels.unsqueeze(-1),
+    ).squeeze(-1)
+    shifted_mask = batch.score_mask[:, 1:]
+    counts = shifted_mask.sum(dim=1)
+    if bool((counts == 0).any().item()):
+        raise ValueError("Each proxy example must score at least one token.")
+    sums = token_logprobs.float().masked_fill(~shifted_mask, 0).sum(dim=1)
+    if reduction == "mean":
+        scores = sums / counts
+    elif reduction == "sum":
+        scores = sums
+    else:
+        raise ValueError(f"Unsupported reduction: {reduction!r}")
+    return [float(score) for score in scores.detach().cpu().tolist()]
 
 
 def score_candidates(
@@ -292,11 +385,12 @@ def _group_expansions_by_parent(
     return grouped
 
 
-def _restore_parent_state(
+def _restore_parent_batch(
     initial_state: Any,
     *,
     parent_path: tuple[int, ...],
-    example_key: ExampleKey,
+    metric: str,
+    batch: ProxyBatch,
     parent_cache: BoundaryCache,
     layer_idx: int,
     device: torch.device,
@@ -305,13 +399,18 @@ def _restore_parent_state(
         if parent_path:
             raise ValueError("Boundary 0 must expand the empty baseline prefix.")
         return initial_state
-    try:
-        cpu_hidden = parent_cache[parent_path][example_key]
-    except KeyError as exc:
-        raise KeyError(
-            f"Missing parent boundary state for path={parent_path}, example={example_key}."
-        ) from exc
-    return replace(initial_state, hidden_states=cpu_hidden.to(device))
+
+    hidden_states = torch.zeros_like(initial_state.hidden_states)
+    for row, (qid, length) in enumerate(zip(batch.qids, batch.sequence_lengths)):
+        example_key = (metric, qid)
+        try:
+            cpu_hidden = parent_cache[parent_path][example_key]
+        except KeyError as exc:
+            raise KeyError(
+                f"Missing parent boundary state for path={parent_path}, example={example_key}."
+            ) from exc
+        hidden_states[row, :length] = cpu_hidden[0].to(device)
+    return replace(initial_state, hidden_states=hidden_states)
 
 
 def _run_local_expansion(
@@ -336,7 +435,8 @@ def score_cached_expansions(
     eq_dataset: dict[str, dict[str, Any]],
     reduction: str,
     device: torch.device,
-    chunk_size: int,
+    batch_size: int,
+    pad_token_id: int,
 ) -> list[BeamCandidate]:
     """Score children from cached parent boundaries without rerunning prefixes."""
     grouped = _group_expansions_by_parent(expansions)
@@ -347,51 +447,47 @@ def score_cached_expansions(
 
     with torch.inference_mode():
         for metric, dataset in (("math", math_dataset), ("eq", eq_dataset)):
-            for cpu_chunk in _dataset_item_chunks(dataset, chunk_size):
-                device_chunk = [
-                    (qid, _move_cached_example(cached, device))
-                    for qid, cached in cpu_chunk
-                ]
-                for qid, cached in device_chunk:
-                    initial_state = runner.prepare(
-                        input_ids=cached["input_ids"],
-                        attention_mask=cached["attention_mask"],
+            for items in _dataset_item_batches(dataset, batch_size):
+                batch = _collate_proxy_batch(
+                    items,
+                    device=device,
+                    pad_token_id=pad_token_id,
+                )
+                initial_state = runner.prepare(
+                    input_ids=batch.input_ids,
+                    attention_mask=batch.attention_mask,
+                )
+                for parent_path, parent_expansions in grouped.items():
+                    parent_state = _restore_parent_batch(
+                        initial_state,
+                        parent_path=parent_path,
+                        metric=metric,
+                        batch=batch,
+                        parent_cache=parent_cache,
+                        layer_idx=layer_idx,
+                        device=device,
                     )
-                    example_key = (metric, qid)
-                    for parent_path, parent_expansions in grouped.items():
-                        parent_state = _restore_parent_state(
-                            initial_state,
-                            parent_path=parent_path,
-                            example_key=example_key,
-                            parent_cache=parent_cache,
+                    plain_state = runner.run_layer_indices(parent_state, (layer_idx,))
+                    for expansion in parent_expansions:
+                        child_state = _run_local_expansion(
+                            runner,
+                            plain_state,
+                            expansion,
                             layer_idx=layer_idx,
-                            device=device,
                         )
-                        plain_state = runner.run_layer_indices(parent_state, (layer_idx,))
-                        for expansion in parent_expansions:
-                            child_state = _run_local_expansion(
-                                runner,
-                                plain_state,
-                                expansion,
-                                layer_idx=layer_idx,
-                            )
-                            final_state = runner.run_range(
-                                child_state,
-                                layer_idx + 1,
-                                runner.num_layers,
-                            )
-                            logits = runner.logits(final_state)
-                            result = score_teacher_forced_logits(
+                        final_state = runner.run_range(
+                            child_state,
+                            layer_idx + 1,
+                            runner.num_layers,
+                        )
+                        logits = runner.logits(final_state)
+                        metric_scores[metric][expansion.child.layer_path].extend(
+                            _score_proxy_batch_logits(
                                 logits=logits,
-                                input_ids=cached["input_ids"],
-                                prompt_length=int(cached["prompt_length"]),
-                                target_mask=cached.get("target_mask"),
+                                batch=batch,
                                 reduction=reduction,
                             )
-                            metric_scores[metric][expansion.child.layer_path].append(
-                                float(result["score"])
-                            )
-                del device_chunk
+                        )
 
     scored: list[BeamCandidate] = []
     for expansion in expansions:
@@ -423,7 +519,8 @@ def materialize_boundary_cache(
     math_dataset: dict[str, dict[str, Any]],
     eq_dataset: dict[str, dict[str, Any]],
     device: torch.device,
-    chunk_size: int,
+    batch_size: int,
+    pad_token_id: int,
 ) -> BoundaryCache:
     """Recreate only winning local expansions and offload their states to CPU."""
     grouped = _group_expansions_by_parent(expansions)
@@ -432,38 +529,43 @@ def materialize_boundary_cache(
     }
     with torch.inference_mode():
         for metric, dataset in (("math", math_dataset), ("eq", eq_dataset)):
-            for cpu_chunk in _dataset_item_chunks(dataset, chunk_size):
-                device_chunk = [
-                    (qid, _move_cached_example(cached, device))
-                    for qid, cached in cpu_chunk
-                ]
-                for qid, cached in device_chunk:
-                    initial_state = runner.prepare(
-                        input_ids=cached["input_ids"],
-                        attention_mask=cached["attention_mask"],
+            for items in _dataset_item_batches(dataset, batch_size):
+                batch = _collate_proxy_batch(
+                    items,
+                    device=device,
+                    pad_token_id=pad_token_id,
+                )
+                initial_state = runner.prepare(
+                    input_ids=batch.input_ids,
+                    attention_mask=batch.attention_mask,
+                )
+                for parent_path, parent_expansions in grouped.items():
+                    parent_state = _restore_parent_batch(
+                        initial_state,
+                        parent_path=parent_path,
+                        metric=metric,
+                        batch=batch,
+                        parent_cache=parent_cache,
+                        layer_idx=layer_idx,
+                        device=device,
                     )
-                    example_key = (metric, qid)
-                    for parent_path, parent_expansions in grouped.items():
-                        parent_state = _restore_parent_state(
-                            initial_state,
-                            parent_path=parent_path,
-                            example_key=example_key,
-                            parent_cache=parent_cache,
+                    plain_state = runner.run_layer_indices(parent_state, (layer_idx,))
+                    for expansion in parent_expansions:
+                        child_state = _run_local_expansion(
+                            runner,
+                            plain_state,
+                            expansion,
                             layer_idx=layer_idx,
-                            device=device,
                         )
-                        plain_state = runner.run_layer_indices(parent_state, (layer_idx,))
-                        for expansion in parent_expansions:
-                            child_state = _run_local_expansion(
-                                runner,
-                                plain_state,
-                                expansion,
-                                layer_idx=layer_idx,
+                        for row, (qid, length) in enumerate(
+                            zip(batch.qids, batch.sequence_lengths)
+                        ):
+                            next_cache[expansion.child.layer_path][(metric, qid)] = (
+                                child_state.hidden_states[row : row + 1, :length]
+                                .detach()
+                                .to("cpu")
+                                .contiguous()
                             )
-                            next_cache[expansion.child.layer_path][example_key] = (
-                                child_state.hidden_states.detach().to("cpu").contiguous()
-                            )
-                del device_chunk
     return next_cache
 
 
@@ -512,7 +614,7 @@ def _write_progress(
             "replay_window": args.replay_window,
             "max_extra_layers": args.max_extra_layers,
             "dataset_limit_per_benchmark": args.dataset_limit,
-            "benchmark_chunk_size": args.benchmark_chunk_size,
+            "benchmark_batch_size": args.benchmark_batch_size,
             "example_reduction": args.reduction,
             "combined_score": "(math_score + eq_score) / 2",
             "requested_final_layer": final_layer,
@@ -670,10 +772,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dataset-limit", type=int, default=None)
     parser.add_argument(
+        "--benchmark-batch-size",
         "--benchmark-chunk-size",
+        dest="benchmark_batch_size",
         type=int,
-        default=8,
-        help="Tokenized examples moved from CPU to the accelerator at once.",
+        default=None,
+        help="Right-padded proxy examples per step (default: 1 on CPU/MPS, 8 on CUDA).",
     )
     parser.add_argument(
         "--exact-dataset-offset",
@@ -724,8 +828,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max-extra-layers must be >= 0.")
     if args.dataset_limit is not None and args.dataset_limit < 1:
         raise ValueError("--dataset-limit must be >= 1.")
-    if args.benchmark_chunk_size < 1:
-        raise ValueError("--benchmark-chunk-size must be >= 1.")
+    if args.benchmark_batch_size is not None and args.benchmark_batch_size < 1:
+        raise ValueError("--benchmark-batch-size must be >= 1.")
     if args.exact_dataset_offset < 0:
         raise ValueError("--exact-dataset-offset must be >= 0.")
     if args.exact_dataset_limit is not None and args.exact_dataset_limit < 1:
@@ -753,6 +857,11 @@ def main() -> None:
     )
     runner = LlamaLikePartialRunner(model)
     device = model_input_device(model)
+    if args.benchmark_batch_size is None:
+        args.benchmark_batch_size = 8 if device.type == "cuda" else 1
+    if tokenizer.pad_token_id is None:
+        raise ValueError("Batched proxy scoring requires tokenizer.pad_token_id.")
+    pad_token_id = int(tokenizer.pad_token_id)
 
     math_raw = _load_dataset(args.math_dataset_path, args.dataset_limit)
     eq_raw = _load_dataset(args.eq_dataset_path, args.dataset_limit)
@@ -788,7 +897,8 @@ def main() -> None:
             eq_dataset=eq_dataset,
             reduction=args.reduction,
             device=device,
-            chunk_size=args.benchmark_chunk_size,
+            batch_size=args.benchmark_batch_size,
+            pad_token_id=pad_token_id,
         )
         scored.sort(key=lambda candidate: float(candidate.score), reverse=True)
         if layer_idx == 0:
@@ -811,7 +921,8 @@ def main() -> None:
                 math_dataset=math_dataset,
                 eq_dataset=eq_dataset,
                 device=device,
-                chunk_size=args.benchmark_chunk_size,
+                batch_size=args.benchmark_batch_size,
+                pad_token_id=pad_token_id,
             )
             boundary_cache_size = boundary_cache_bytes(parent_cache)
             peak_boundary_cache_size = max(

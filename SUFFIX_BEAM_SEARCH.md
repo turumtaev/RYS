@@ -454,19 +454,34 @@ Only start after:
 Status: done
 
 - teacher-forced benchmark tensors remain in CPU memory
-- only one configurable chunk is moved to the accelerator
-- all child architectures are scored before that chunk is released
-- `--benchmark-chunk-size` defaults to `8`
+- only one configurable example group is moved to the accelerator
+- that group is now evaluated as a real padded batch
+- `--benchmark-chunk-size` remains as an alias for `--benchmark-batch-size`
 
-Qwen MPS equivalence probe with four Math and four EQ examples:
+### Padding-aware proxy batching
 
-- chunk sizes `1` and `4` produced bit-identical scores and beam paths
-- chunk size `1`: `30.3s` through boundary 2
-- chunk size `4`: `14.2s` through boundary 2
+Status: implemented; CUDA profiling pending
 
-Small chunks reduce peak residency but add substantial transfer and dispatch
-overhead. Chunk size should therefore be the largest value that fits alongside
-the model and any future boundary-state cache.
+- examples are right-padded within each batch
+- examples are sorted by tokenized length within each benchmark before batching
+- attention masks exclude padding from decoder attention
+- full-sequence score masks support different prompt and target lengths
+- EOS and EQ delimiter tokens remain scored
+- proxy reductions happen per example before benchmark averaging
+- masked reductions are vectorized and accumulated in float32
+- cached hidden states remain unpadded in CPU RAM and are padded only on reload
+
+Qwen MPS probe with four Math and four EQ examples:
+
+- batch 1: `14.6s`
+- batch 4 before length sorting/vectorized reduction: `16.4s`
+- optimized batch 4: `15.6s`
+- both runs retained identical beam paths
+- maximum score difference was `1.22e-4` in float16
+
+Batching did not help this MPS workload because EQ padding and large vocabulary
+logits outweighed launch savings. The automatic default is therefore batch 1
+for CPU/MPS and batch 8 for CUDA. CUDA batch size still needs profiling.
 
 ### CPU activation-cache profile
 
@@ -536,11 +551,11 @@ Validation:
 
 In order:
 
-1. Add padding-aware batched proxy scoring with full-sequence score masks.
-2. Preserve lower-budget candidates so a small replay budget does not get spent only in early layers.
-3. Tune the current global-beam hyperparameters on a validation split.
-4. Compare global and budget-indexed beams at matched compute.
-5. Profile the cached implementation on the intended GPU/model combination.
+1. Tune the current global-beam hyperparameters on a validation split.
+2. Implement budget-indexed beams that preserve candidates at each replay budget.
+3. Compare global and budget-indexed beams at matched compute.
+4. Tune the budget-indexed method only if it shows value.
+5. Profile CUDA batch size and the cached implementation on the intended GPU/model combination.
 
 ## 13. Commands We Can Reuse
 

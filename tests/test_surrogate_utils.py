@@ -17,6 +17,7 @@ from transformers import (
 from scripts.beam_search import (
     BeamCandidate,
     _dataset_chunks,
+    _dataset_item_batches,
     _load_dataset,
     _write_exact_validation,
     boundary_cache_bytes,
@@ -350,10 +351,10 @@ class SurrogateUtilsTests(unittest.TestCase):
                 "target_mask": torch.tensor([[True, True]]),
             },
             "b": {
-                "input_ids": torch.tensor([[5, 6, 7, 8]]),
-                "attention_mask": torch.ones((1, 4), dtype=torch.long),
+                "input_ids": torch.tensor([[5, 6, 7, 8, 9]]),
+                "attention_mask": torch.ones((1, 5), dtype=torch.long),
                 "prompt_length": 2,
-                "target_mask": torch.tensor([[True, False]]),
+                "target_mask": torch.tensor([[True, False, True]]),
             },
         }
         candidates = [
@@ -383,6 +384,11 @@ class SurrogateUtilsTests(unittest.TestCase):
         )
 
         self.assertEqual(len(list(_dataset_chunks(dataset, 1))), 2)
+        batches = list(_dataset_item_batches(dataset, 2))
+        self.assertEqual(
+            [cached["input_ids"].shape[1] for _, cached in batches[0]],
+            [4, 5],
+        )
         for chunked_candidate, unchunked_candidate in zip(chunked, unchunked):
             self.assertAlmostEqual(chunked_candidate.score, unchunked_candidate.score)
             self.assertAlmostEqual(chunked_candidate.math_score, unchunked_candidate.math_score)
@@ -399,10 +405,10 @@ class SurrogateUtilsTests(unittest.TestCase):
                 "target_mask": torch.tensor([[True, True]]),
             },
             "b": {
-                "input_ids": torch.tensor([[5, 6, 7, 8]]),
-                "attention_mask": torch.ones((1, 4), dtype=torch.long),
+                "input_ids": torch.tensor([[5, 6, 7, 8, 9]]),
+                "attention_mask": torch.ones((1, 5), dtype=torch.long),
                 "prompt_length": 2,
-                "target_mask": torch.tensor([[True, False]]),
+                "target_mask": torch.tensor([[True, False, True]]),
             },
         }
         beam = [BeamCandidate(layer_path=(), replays=())]
@@ -425,7 +431,8 @@ class SurrogateUtilsTests(unittest.TestCase):
                 eq_dataset=dataset,
                 reduction="mean",
                 device=torch.device("cpu"),
-                chunk_size=1,
+                batch_size=2,
+                pad_token_id=0,
             )
             recomputed = score_candidates(
                 runner,
@@ -441,9 +448,9 @@ class SurrogateUtilsTests(unittest.TestCase):
             cached_by_path = {candidate.layer_path: candidate for candidate in cached}
             for candidate in recomputed:
                 actual = cached_by_path[candidate.layer_path]
-                self.assertAlmostEqual(actual.score, candidate.score)
-                self.assertAlmostEqual(actual.math_score, candidate.math_score)
-                self.assertAlmostEqual(actual.eq_score, candidate.eq_score)
+                self.assertTrue(math.isclose(actual.score, candidate.score, abs_tol=1e-6))
+                self.assertTrue(math.isclose(actual.math_score, candidate.math_score, abs_tol=1e-6))
+                self.assertTrue(math.isclose(actual.eq_score, candidate.eq_score, abs_tol=1e-6))
 
             cached.sort(key=lambda candidate: float(candidate.score), reverse=True)
             beam = cached[:2]
@@ -459,7 +466,8 @@ class SurrogateUtilsTests(unittest.TestCase):
                     math_dataset=dataset,
                     eq_dataset=dataset,
                     device=torch.device("cpu"),
-                    chunk_size=1,
+                    batch_size=2,
+                    pad_token_id=0,
                 )
                 self.assertGreater(boundary_cache_bytes(parent_cache), 0)
                 self.assertTrue(all(len(states) == 4 for states in parent_cache.values()))
