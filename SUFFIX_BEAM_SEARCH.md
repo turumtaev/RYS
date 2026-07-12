@@ -166,23 +166,28 @@ This branch implements the first correctness-first version of the suffix search.
 - uncached partial-layer execution for Llama/Qwen-style decoder stacks
 - arbitrary and repeated layer paths without rebuilding the model stack
 - boundary-by-boundary local replay expansion
-- uncached benchmark proxy ranking and beam pruning
+- chunked benchmark proxy ranking and beam pruning
+- candidate-owned CPU hidden states at every layer boundary
+- prefix reuse across child expansions
+- exact generation-based shortlist validation
+- held-out validation dataset selection
 - Mac-compatible local environment
 - small local smoke validation
 
 ### Not implemented yet
 
-- benchmark-side KV / activation reuse across children
-- exact shortlist validation flow wired to the new search
+- replay-budget-diverse beam retention
+- intended large-model GPU validation
 
-The uncached search has now completed a full tiny-model smoke run. Its ranking
-still needs validation on a larger benchmark subset and with exact generation.
+The cached search now runs end to end and matches full-prefix recomputation.
+The next search-quality issue is preventing every beam candidate from spending
+a small replay budget only in early layers.
 
 ## 8. Current Stage
 
 We are in:
 
-- `Stage F: correlation / shortlist validation`
+- `Search-quality refinement: replay-budget diversity`
 
 Status:
 
@@ -192,8 +197,10 @@ Status:
 - real Math and EQ smoke runs are passing
 - MPS is available in normal, unsandboxed execution
 - partial and repeated layer paths match Hugging Face full-model execution
-- the uncached suffix-search driver is implemented
+- the cached suffix-search driver is implemented
+- exact shortlist and held-out validation are implemented
 - a full 30-boundary tiny-model MPS smoke search completed successfully
+- a full 24-boundary Qwen search completed on all 16+16 benchmark examples
 
 ## 9. Completed Work
 
@@ -446,7 +453,7 @@ the model and any future boundary-state cache.
 
 ### CPU activation-cache profile
 
-Status: profile supports implementation
+Status: implemented and validated
 
 Qwen2.5-0.5B, float16, boundary 12, four Math plus four EQ examples:
 
@@ -464,8 +471,8 @@ Full 16+16 benchmark footprint:
 - beam 12: about `299 MiB`
 - beam 24: about `599 MiB`
 
-CPU RAM and transfer speed are therefore sufficient on the Mac. The cache
-implementation should use two passes at each boundary:
+CPU RAM and transfer speed are sufficient on the Mac. The implementation uses
+two passes at each boundary:
 
 1. score all children from cached parent states without retaining every child
 2. prune globally, then recompute only the top children's short local expansion
@@ -474,14 +481,36 @@ implementation should use two passes at each boundary:
 This keeps resident CPU cache proportional to the beam width instead of the
 full branching factor `C * (1 + W)`.
 
+Implemented candidate state:
+
+- partial layer path and replay blocks
+- proxy scores
+- one CPU hidden-state tensor per Math/EQ benchmark example at the current boundary
+
+At boundary `k`, scoring now:
+
+1. restores each parent's hidden state after `k-1`
+2. runs layer `k` once per parent
+3. creates plain and replay children from that state
+4. runs only suffix `k+1 .. N-1` for proxy scoring
+5. prunes globally
+6. reruns only the winners' short local expansion and offloads their new states
+
+Validation:
+
+- synthetic cached search matches full-prefix recomputation across boundaries
+- Qwen MPS scores and beam paths are bit-identical to uncached runs
+- capped two-example search: `30.5s` uncached, `21.9s` cached (`1.39x`)
+- continuously branching search: `87.3s` uncached, `52.7s` cached (`1.66x`)
+- full 16+16 benchmark completed all 24 boundaries with a stable `49.9 MiB` cache
+
 ## 12. Immediate Next Tasks
 
 In order:
 
-1. Implement two-pass CPU boundary-state reuse.
-2. Verify cached and uncached searches produce identical scores and beams.
-3. Measure end-to-end speedup on Qwen2.5-0.5B.
-4. Sweep larger replay budgets with exact held-out validation.
+1. Preserve lower-budget candidates so a small replay budget does not get spent only in early layers.
+2. Sweep larger replay budgets with exact held-out validation.
+3. Profile the cached implementation on the intended GPU/model combination.
 
 ## 13. Commands We Can Reuse
 

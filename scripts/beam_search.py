@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """Boundary-by-boundary beam search for benchmark-optimal layer replays.
 
-This correctness-first implementation recomputes each complete candidate path.
-Activation reuse can be added after the search behavior is validated end to end.
+Surviving candidates keep CPU hidden states at the current layer boundary.
+Children restore those states, run only their local expansion and fixed suffix,
+then materialize new boundary states only after global beam pruning.
 """
 
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import json
 from pathlib import Path
 import time
@@ -50,6 +51,19 @@ class BeamCandidate:
     eq_score: float | None = None
 
 
+@dataclass(frozen=True)
+class CandidateExpansion:
+    """A child architecture and the local operation that produced it."""
+
+    child: BeamCandidate
+    parent_path: tuple[int, ...]
+    replay_start: int | None
+
+
+ExampleKey = tuple[str, str]
+BoundaryCache = dict[tuple[int, ...], dict[ExampleKey, torch.Tensor]]
+
+
 def expand_candidate(
     candidate: BeamCandidate,
     *,
@@ -59,13 +73,40 @@ def expand_candidate(
     max_extra_layers: int | None = None,
 ) -> list[BeamCandidate]:
     """Append plain layer ``k`` and local replay alternatives ending at ``k``."""
+    return [
+        expansion.child
+        for expansion in expand_candidate_with_parents(
+            candidate,
+            layer_idx=layer_idx,
+            replay_window=replay_window,
+            num_layers=num_layers,
+            max_extra_layers=max_extra_layers,
+        )
+    ]
+
+
+def expand_candidate_with_parents(
+    candidate: BeamCandidate,
+    *,
+    layer_idx: int,
+    replay_window: int,
+    num_layers: int,
+    max_extra_layers: int | None = None,
+) -> list[CandidateExpansion]:
+    """Expand one candidate while retaining the parent and replay operation."""
     if layer_idx < 0 or layer_idx >= num_layers:
         raise ValueError(f"layer_idx must be in [0, {num_layers}).")
     if replay_window < 0:
         raise ValueError("replay_window must be >= 0.")
 
     plain_path = candidate.layer_path + (layer_idx,)
-    children = [BeamCandidate(layer_path=plain_path, replays=candidate.replays)]
+    expansions = [
+        CandidateExpansion(
+            child=BeamCandidate(layer_path=plain_path, replays=candidate.replays),
+            parent_path=candidate.layer_path,
+            replay_start=None,
+        )
+    ]
     first_replay_layer = max(0, layer_idx - replay_window + 1)
     for replay_start in range(first_replay_layer, layer_idx + 1):
         replay_path = tuple(range(replay_start, layer_idx + 1))
@@ -73,13 +114,17 @@ def expand_candidate(
         extra_layers = len(child_path) - (layer_idx + 1)
         if max_extra_layers is not None and extra_layers > max_extra_layers:
             continue
-        children.append(
-            BeamCandidate(
-                layer_path=child_path,
-                replays=candidate.replays + ((replay_start, layer_idx + 1),),
+        expansions.append(
+            CandidateExpansion(
+                child=BeamCandidate(
+                    layer_path=child_path,
+                    replays=candidate.replays + ((replay_start, layer_idx + 1),),
+                ),
+                parent_path=candidate.layer_path,
+                replay_start=replay_start,
             )
         )
-    return children
+    return expansions
 
 
 def expand_beam(
@@ -91,16 +136,37 @@ def expand_beam(
     max_extra_layers: int | None = None,
 ) -> list[BeamCandidate]:
     """Expand and deduplicate all candidates at one boundary."""
-    unique: dict[tuple[int, ...], BeamCandidate] = {}
+    return [
+        expansion.child
+        for expansion in expand_beam_with_parents(
+            beam,
+            layer_idx=layer_idx,
+            replay_window=replay_window,
+            num_layers=num_layers,
+            max_extra_layers=max_extra_layers,
+        )
+    ]
+
+
+def expand_beam_with_parents(
+    beam: Iterable[BeamCandidate],
+    *,
+    layer_idx: int,
+    replay_window: int,
+    num_layers: int,
+    max_extra_layers: int | None = None,
+) -> list[CandidateExpansion]:
+    """Expand a beam and retain one parent operation per unique child path."""
+    unique: dict[tuple[int, ...], CandidateExpansion] = {}
     for candidate in beam:
-        for child in expand_candidate(
+        for expansion in expand_candidate_with_parents(
             candidate,
             layer_idx=layer_idx,
             replay_window=replay_window,
             num_layers=num_layers,
             max_extra_layers=max_extra_layers,
         ):
-            unique.setdefault(child.layer_path, child)
+            unique.setdefault(expansion.child.layer_path, expansion)
     return list(unique.values())
 
 
@@ -130,6 +196,15 @@ def _dataset_chunks(
     values = list(dataset.values())
     for start in range(0, len(values), chunk_size):
         yield values[start : start + chunk_size]
+
+
+def _dataset_item_chunks(
+    dataset: dict[str, dict[str, Any]],
+    chunk_size: int,
+) -> Iterable[list[tuple[str, dict[str, Any]]]]:
+    items = list(dataset.items())
+    for start in range(0, len(items), chunk_size):
+        yield items[start : start + chunk_size]
 
 
 def _move_cached_example(cached: dict[str, Any], device: torch.device) -> dict[str, Any]:
@@ -208,6 +283,198 @@ def score_candidates(
     return scored
 
 
+def _group_expansions_by_parent(
+    expansions: Iterable[CandidateExpansion],
+) -> dict[tuple[int, ...], list[CandidateExpansion]]:
+    grouped: dict[tuple[int, ...], list[CandidateExpansion]] = {}
+    for expansion in expansions:
+        grouped.setdefault(expansion.parent_path, []).append(expansion)
+    return grouped
+
+
+def _restore_parent_state(
+    initial_state: Any,
+    *,
+    parent_path: tuple[int, ...],
+    example_key: ExampleKey,
+    parent_cache: BoundaryCache,
+    layer_idx: int,
+    device: torch.device,
+) -> Any:
+    if layer_idx == 0:
+        if parent_path:
+            raise ValueError("Boundary 0 must expand the empty baseline prefix.")
+        return initial_state
+    try:
+        cpu_hidden = parent_cache[parent_path][example_key]
+    except KeyError as exc:
+        raise KeyError(
+            f"Missing parent boundary state for path={parent_path}, example={example_key}."
+        ) from exc
+    return replace(initial_state, hidden_states=cpu_hidden.to(device))
+
+
+def _run_local_expansion(
+    runner: LlamaLikePartialRunner,
+    plain_state: Any,
+    expansion: CandidateExpansion,
+    *,
+    layer_idx: int,
+) -> Any:
+    if expansion.replay_start is None:
+        return plain_state
+    return runner.run_range(plain_state, expansion.replay_start, layer_idx + 1)
+
+
+def score_cached_expansions(
+    runner: LlamaLikePartialRunner,
+    expansions: list[CandidateExpansion],
+    *,
+    parent_cache: BoundaryCache,
+    layer_idx: int,
+    math_dataset: dict[str, dict[str, Any]],
+    eq_dataset: dict[str, dict[str, Any]],
+    reduction: str,
+    device: torch.device,
+    chunk_size: int,
+) -> list[BeamCandidate]:
+    """Score children from cached parent boundaries without rerunning prefixes."""
+    grouped = _group_expansions_by_parent(expansions)
+    metric_scores: dict[str, dict[tuple[int, ...], list[float]]] = {
+        "math": {expansion.child.layer_path: [] for expansion in expansions},
+        "eq": {expansion.child.layer_path: [] for expansion in expansions},
+    }
+
+    with torch.inference_mode():
+        for metric, dataset in (("math", math_dataset), ("eq", eq_dataset)):
+            for cpu_chunk in _dataset_item_chunks(dataset, chunk_size):
+                device_chunk = [
+                    (qid, _move_cached_example(cached, device))
+                    for qid, cached in cpu_chunk
+                ]
+                for qid, cached in device_chunk:
+                    initial_state = runner.prepare(
+                        input_ids=cached["input_ids"],
+                        attention_mask=cached["attention_mask"],
+                    )
+                    example_key = (metric, qid)
+                    for parent_path, parent_expansions in grouped.items():
+                        parent_state = _restore_parent_state(
+                            initial_state,
+                            parent_path=parent_path,
+                            example_key=example_key,
+                            parent_cache=parent_cache,
+                            layer_idx=layer_idx,
+                            device=device,
+                        )
+                        plain_state = runner.run_layer_indices(parent_state, (layer_idx,))
+                        for expansion in parent_expansions:
+                            child_state = _run_local_expansion(
+                                runner,
+                                plain_state,
+                                expansion,
+                                layer_idx=layer_idx,
+                            )
+                            final_state = runner.run_range(
+                                child_state,
+                                layer_idx + 1,
+                                runner.num_layers,
+                            )
+                            logits = runner.logits(final_state)
+                            result = score_teacher_forced_logits(
+                                logits=logits,
+                                input_ids=cached["input_ids"],
+                                prompt_length=int(cached["prompt_length"]),
+                                target_mask=cached.get("target_mask"),
+                                reduction=reduction,
+                            )
+                            metric_scores[metric][expansion.child.layer_path].append(
+                                float(result["score"])
+                            )
+                del device_chunk
+
+    scored: list[BeamCandidate] = []
+    for expansion in expansions:
+        path = expansion.child.layer_path
+        math_values = metric_scores["math"][path]
+        eq_values = metric_scores["eq"][path]
+        if not math_values or not eq_values:
+            raise ValueError("Cannot score an empty proxy dataset.")
+        math_score = sum(math_values) / len(math_values)
+        eq_score = sum(eq_values) / len(eq_values)
+        scored.append(
+            BeamCandidate(
+                layer_path=path,
+                replays=expansion.child.replays,
+                score=(math_score + eq_score) / 2.0,
+                math_score=math_score,
+                eq_score=eq_score,
+            )
+        )
+    return scored
+
+
+def materialize_boundary_cache(
+    runner: LlamaLikePartialRunner,
+    expansions: list[CandidateExpansion],
+    *,
+    parent_cache: BoundaryCache,
+    layer_idx: int,
+    math_dataset: dict[str, dict[str, Any]],
+    eq_dataset: dict[str, dict[str, Any]],
+    device: torch.device,
+    chunk_size: int,
+) -> BoundaryCache:
+    """Recreate only winning local expansions and offload their states to CPU."""
+    grouped = _group_expansions_by_parent(expansions)
+    next_cache: BoundaryCache = {
+        expansion.child.layer_path: {} for expansion in expansions
+    }
+    with torch.inference_mode():
+        for metric, dataset in (("math", math_dataset), ("eq", eq_dataset)):
+            for cpu_chunk in _dataset_item_chunks(dataset, chunk_size):
+                device_chunk = [
+                    (qid, _move_cached_example(cached, device))
+                    for qid, cached in cpu_chunk
+                ]
+                for qid, cached in device_chunk:
+                    initial_state = runner.prepare(
+                        input_ids=cached["input_ids"],
+                        attention_mask=cached["attention_mask"],
+                    )
+                    example_key = (metric, qid)
+                    for parent_path, parent_expansions in grouped.items():
+                        parent_state = _restore_parent_state(
+                            initial_state,
+                            parent_path=parent_path,
+                            example_key=example_key,
+                            parent_cache=parent_cache,
+                            layer_idx=layer_idx,
+                            device=device,
+                        )
+                        plain_state = runner.run_layer_indices(parent_state, (layer_idx,))
+                        for expansion in parent_expansions:
+                            child_state = _run_local_expansion(
+                                runner,
+                                plain_state,
+                                expansion,
+                                layer_idx=layer_idx,
+                            )
+                            next_cache[expansion.child.layer_path][example_key] = (
+                                child_state.hidden_states.detach().to("cpu").contiguous()
+                            )
+                del device_chunk
+    return next_cache
+
+
+def boundary_cache_bytes(cache: BoundaryCache) -> int:
+    return sum(
+        tensor.numel() * tensor.element_size()
+        for candidate_cache in cache.values()
+        for tensor in candidate_cache.values()
+    )
+
+
 def _candidate_json(candidate: BeamCandidate, *, layer_idx: int, num_layers: int) -> dict[str, Any]:
     data = asdict(candidate)
     data["layer_path"] = list(candidate.layer_path)
@@ -227,6 +494,8 @@ def _write_progress(
     final_layer: int,
     beam: list[BeamCandidate],
     elapsed_seconds: float,
+    boundary_cache_size: int,
+    peak_boundary_cache_size: int,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     finished_proxy_search = layer_idx == final_layer
@@ -249,6 +518,8 @@ def _write_progress(
             "requested_final_layer": final_layer,
             "last_completed_layer": layer_idx,
             "elapsed_seconds": elapsed_seconds,
+            "boundary_cache_mib": boundary_cache_size / 2**20,
+            "peak_boundary_cache_mib": peak_boundary_cache_size / 2**20,
         },
         "beam": [
             _candidate_json(candidate, layer_idx=layer_idx, num_layers=model_metadata["num_layers"])
@@ -495,20 +766,23 @@ def main() -> None:
         final_layer = min(final_layer, args.stop_after_layer)
 
     beam = [BeamCandidate(layer_path=(), replays=())]
+    parent_cache: BoundaryCache = {}
     baseline_proxy_score: float | None = None
+    peak_boundary_cache_size = 0
     started = time.monotonic()
     output_path = Path(args.output)
     for layer_idx in range(final_layer + 1):
-        children = expand_beam(
+        expansions = expand_beam_with_parents(
             beam,
             layer_idx=layer_idx,
             replay_window=args.replay_window,
             num_layers=runner.num_layers,
             max_extra_layers=args.max_extra_layers,
         )
-        scored = score_candidates(
+        scored = score_cached_expansions(
             runner,
-            children,
+            expansions,
+            parent_cache=parent_cache,
             layer_idx=layer_idx,
             math_dataset=math_dataset,
             eq_dataset=eq_dataset,
@@ -521,12 +795,36 @@ def main() -> None:
             baseline = next(candidate for candidate in scored if not candidate.replays)
             baseline_proxy_score = float(baseline.score)
         beam = scored[: args.beam_width]
+        boundary_cache_size = 0
+        if layer_idx < final_layer:
+            expansion_by_path = {
+                expansion.child.layer_path: expansion for expansion in expansions
+            }
+            winning_expansions = [
+                expansion_by_path[candidate.layer_path] for candidate in beam
+            ]
+            parent_cache = materialize_boundary_cache(
+                runner,
+                winning_expansions,
+                parent_cache=parent_cache,
+                layer_idx=layer_idx,
+                math_dataset=math_dataset,
+                eq_dataset=eq_dataset,
+                device=device,
+                chunk_size=args.benchmark_chunk_size,
+            )
+            boundary_cache_size = boundary_cache_bytes(parent_cache)
+            peak_boundary_cache_size = max(
+                peak_boundary_cache_size,
+                boundary_cache_size,
+            )
         elapsed = time.monotonic() - started
         best = beam[0]
         print(
-            f"layer={layer_idx} children={len(children)} "
+            f"layer={layer_idx} children={len(expansions)} "
             f"best={best.score:.6f} math={best.math_score:.6f} "
-            f"eq={best.eq_score:.6f} replays={best.replays} elapsed={elapsed:.1f}s",
+            f"eq={best.eq_score:.6f} replays={best.replays} "
+            f"cache={boundary_cache_size / 2**20:.1f}MiB elapsed={elapsed:.1f}s",
             flush=True,
         )
         _write_progress(
@@ -537,6 +835,8 @@ def main() -> None:
             final_layer=final_layer,
             beam=beam,
             elapsed_seconds=elapsed,
+            boundary_cache_size=boundary_cache_size,
+            peak_boundary_cache_size=peak_boundary_cache_size,
         )
 
     if args.exact_top_k > 0:

@@ -19,9 +19,13 @@ from scripts.beam_search import (
     _dataset_chunks,
     _load_dataset,
     _write_exact_validation,
+    boundary_cache_bytes,
     complete_layer_path,
     expand_beam,
+    expand_beam_with_parents,
     expand_candidate,
+    materialize_boundary_cache,
+    score_cached_expansions,
     score_candidates,
 )
 from src.core.layer_duplicator import build_model_with_layers
@@ -331,6 +335,82 @@ class SurrogateUtilsTests(unittest.TestCase):
             self.assertAlmostEqual(chunked_candidate.score, unchunked_candidate.score)
             self.assertAlmostEqual(chunked_candidate.math_score, unchunked_candidate.math_score)
             self.assertAlmostEqual(chunked_candidate.eq_score, unchunked_candidate.eq_score)
+
+    def test_cached_boundary_search_matches_full_prefix_recomputation(self):
+        model = self._tiny_llama()
+        runner = LlamaLikePartialRunner(model)
+        dataset = {
+            "a": {
+                "input_ids": torch.tensor([[1, 2, 3, 4]]),
+                "attention_mask": torch.ones((1, 4), dtype=torch.long),
+                "prompt_length": 2,
+                "target_mask": torch.tensor([[True, True]]),
+            },
+            "b": {
+                "input_ids": torch.tensor([[5, 6, 7, 8]]),
+                "attention_mask": torch.ones((1, 4), dtype=torch.long),
+                "prompt_length": 2,
+                "target_mask": torch.tensor([[True, False]]),
+            },
+        }
+        beam = [BeamCandidate(layer_path=(), replays=())]
+        parent_cache = {}
+
+        for layer_idx in range(2):
+            expansions = expand_beam_with_parents(
+                beam,
+                layer_idx=layer_idx,
+                replay_window=2,
+                num_layers=runner.num_layers,
+                max_extra_layers=2,
+            )
+            cached = score_cached_expansions(
+                runner,
+                expansions,
+                parent_cache=parent_cache,
+                layer_idx=layer_idx,
+                math_dataset=dataset,
+                eq_dataset=dataset,
+                reduction="mean",
+                device=torch.device("cpu"),
+                chunk_size=1,
+            )
+            recomputed = score_candidates(
+                runner,
+                [expansion.child for expansion in expansions],
+                layer_idx=layer_idx,
+                math_dataset=dataset,
+                eq_dataset=dataset,
+                reduction="mean",
+                device=torch.device("cpu"),
+                chunk_size=1,
+            )
+
+            cached_by_path = {candidate.layer_path: candidate for candidate in cached}
+            for candidate in recomputed:
+                actual = cached_by_path[candidate.layer_path]
+                self.assertAlmostEqual(actual.score, candidate.score)
+                self.assertAlmostEqual(actual.math_score, candidate.math_score)
+                self.assertAlmostEqual(actual.eq_score, candidate.eq_score)
+
+            cached.sort(key=lambda candidate: float(candidate.score), reverse=True)
+            beam = cached[:2]
+            if layer_idx == 0:
+                expansion_by_path = {
+                    expansion.child.layer_path: expansion for expansion in expansions
+                }
+                parent_cache = materialize_boundary_cache(
+                    runner,
+                    [expansion_by_path[candidate.layer_path] for candidate in beam],
+                    parent_cache=parent_cache,
+                    layer_idx=layer_idx,
+                    math_dataset=dataset,
+                    eq_dataset=dataset,
+                    device=torch.device("cpu"),
+                    chunk_size=1,
+                )
+                self.assertGreater(boundary_cache_bytes(parent_cache), 0)
+                self.assertTrue(all(len(states) == 4 for states in parent_cache.values()))
 
     def test_partial_runner_matches_full_forward_and_split_execution(self):
         model = self._tiny_llama()
