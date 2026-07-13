@@ -4,6 +4,7 @@ import json
 import math
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 
 import torch
@@ -18,11 +19,13 @@ from scripts.beam_search import (
     BeamCandidate,
     _dataset_chunks,
     _dataset_item_batches,
+    _collate_proxy_batch,
     _load_dataset,
     _write_exact_validation,
     boundary_cache_bytes,
     candidate_replay_budget,
     complete_layer_path,
+    default_benchmark_batch_size,
     expand_beam,
     expand_beam_with_parents,
     expand_candidate,
@@ -30,9 +33,15 @@ from scripts.beam_search import (
     score_cached_expansions,
     score_candidates,
     select_budget_indexed_beams,
+    resolve_exact_dataset_selection,
 )
+from scripts.evaluate_exact_configs import parse_config
 from src.core.layer_duplicator import build_model_with_layers
-from src.workers.eq_worker import build_eq_first_pass_target, serialize_eq_first_pass_target
+from src.workers.eq_worker import (
+    build_eq_first_pass_target,
+    select_eq_reference,
+    serialize_eq_first_pass_target,
+)
 from src.workers.math_worker import build_math_target, serialize_math_target
 from src.workers.model_utils import (
     LlamaLikePartialRunner,
@@ -104,6 +113,27 @@ class SurrogateUtilsTests(unittest.TestCase):
         counts = [1, 2, 2, 1]
         overhead = relative_overhead_from_counts(counts, num_layers=4)
         self.assertAlmostEqual(overhead, 0.5)
+
+    def test_eq_reference_prefers_independent_fullscale_scores(self):
+        normalized = {"emotion1_score": 2.5}
+        fullscale = {"emotion1_score": 7}
+        self.assertIs(
+            select_eq_reference(
+                {
+                    "reference_answer": normalized,
+                    "reference_answer_fullscale": fullscale,
+                }
+            ),
+            fullscale,
+        )
+        self.assertIs(select_eq_reference({"reference_answer": normalized}), normalized)
+
+    def test_exact_config_repeat_count_is_extra_copies(self):
+        label, path, metadata = parse_config("layer10_x3=repeat:10,2", 64)
+        self.assertEqual(label, "layer10_x3")
+        self.assertEqual(path.count(10), 3)
+        self.assertEqual(len(path), 66)
+        self.assertEqual(metadata, {"type": "repeat", "layer": 10, "extra": 2})
 
     def test_stable_quantile_bins(self):
         values = [0.1, 0.2, 0.3, 0.4, 0.5]
@@ -368,6 +398,8 @@ class SurrogateUtilsTests(unittest.TestCase):
                 eq_max_new=384,
                 batch_size=1,
                 dataset_offset=2,
+                math_dataset_path="datasets/math_120.json",
+                eq_dataset_path="datasets/eq_140.json",
             )
             payload = json.loads(output_path.read_text())
 
@@ -379,6 +411,8 @@ class SurrogateUtilsTests(unittest.TestCase):
         self.assertEqual(validation["math_max_new"], 64)
         self.assertEqual(validation["eq_max_new"], 384)
         self.assertEqual(validation["dataset_offset"], 2)
+        self.assertEqual(validation["math_dataset_path"], "datasets/math_120.json")
+        self.assertEqual(validation["eq_dataset_path"], "datasets/eq_140.json")
         self.assertEqual(validation["examples_per_benchmark"], 2)
 
     def test_load_dataset_applies_offset_before_limit(self):
@@ -388,6 +422,31 @@ class SurrogateUtilsTests(unittest.TestCase):
             selected = _load_dataset(str(dataset_path), 1, offset=1)
 
         self.assertEqual(selected, {"b": 2})
+
+    def test_qwen35_cuda_defaults_to_single_example_batches(self):
+        self.assertEqual(
+            default_benchmark_batch_size(torch.device("cuda"), "qwen3_5"),
+            1,
+        )
+        self.assertEqual(
+            default_benchmark_batch_size(torch.device("cuda"), "qwen2"),
+            8,
+        )
+
+    def test_separate_exact_datasets_default_to_full_files(self):
+        args = SimpleNamespace(
+            math_dataset_path="datasets/math_16.json",
+            eq_dataset_path="datasets/eq_16.json",
+            exact_math_dataset_path="datasets/math_120.json",
+            exact_eq_dataset_path="datasets/eq_140.json",
+            exact_dataset_limit=None,
+            dataset_limit=16,
+        )
+
+        self.assertEqual(
+            resolve_exact_dataset_selection(args),
+            ("datasets/math_120.json", "datasets/eq_140.json", None),
+        )
 
     def test_chunked_candidate_scoring_is_chunk_size_invariant(self):
         model = self._tiny_llama()
@@ -442,6 +501,43 @@ class SurrogateUtilsTests(unittest.TestCase):
             self.assertAlmostEqual(chunked_candidate.score, unchunked_candidate.score)
             self.assertAlmostEqual(chunked_candidate.math_score, unchunked_candidate.math_score)
             self.assertAlmostEqual(chunked_candidate.eq_score, unchunked_candidate.eq_score)
+
+    def test_left_padded_proxy_batch_preserves_token_positions(self):
+        items = [
+            (
+                "short",
+                {
+                    "input_ids": torch.tensor([[1, 2]]),
+                    "attention_mask": torch.ones((1, 2), dtype=torch.long),
+                    "prompt_length": 1,
+                    "target_mask": torch.tensor([[True]]),
+                },
+            ),
+            (
+                "long",
+                {
+                    "input_ids": torch.tensor([[3, 4, 5]]),
+                    "attention_mask": torch.ones((1, 3), dtype=torch.long),
+                    "prompt_length": 1,
+                    "target_mask": torch.tensor([[True, False]]),
+                },
+            ),
+        ]
+
+        batch = _collate_proxy_batch(
+            items,
+            device=torch.device("cpu"),
+            pad_token_id=0,
+            padding_side="left",
+        )
+
+        torch.testing.assert_close(batch.input_ids, torch.tensor([[0, 1, 2], [3, 4, 5]]))
+        torch.testing.assert_close(batch.attention_mask, torch.tensor([[0, 1, 1], [1, 1, 1]]))
+        torch.testing.assert_close(batch.position_ids, torch.tensor([[0, 0, 1], [0, 1, 2]]))
+        torch.testing.assert_close(
+            batch.score_mask,
+            torch.tensor([[False, False, True], [False, True, False]]),
+        )
 
     def test_cached_boundary_search_matches_full_prefix_recomputation(self):
         model = self._tiny_llama()
@@ -520,6 +616,13 @@ class SurrogateUtilsTests(unittest.TestCase):
                 )
                 self.assertGreater(boundary_cache_bytes(parent_cache), 0)
                 self.assertTrue(all(len(states) == 4 for states in parent_cache.values()))
+                self.assertTrue(
+                    all(
+                        state.shape[1] == 5
+                        for states in parent_cache.values()
+                        for state in states.values()
+                    )
+                )
 
     def test_partial_runner_matches_full_forward_and_split_execution(self):
         model = self._tiny_llama()

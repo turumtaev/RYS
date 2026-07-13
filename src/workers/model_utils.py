@@ -453,7 +453,15 @@ class LlamaLikePartialRunner:
             "position_ids": position_ids,
         }
         full_mask = create_causal_mask(**mask_kwargs)
-        if getattr(self.decoder, "has_sliding_layers", False):
+        if hasattr(self.decoder, "_update_linear_attn_mask"):
+            attention_masks: Any = {
+                "full_attention": full_mask,
+                "linear_attention": self.decoder._update_linear_attn_mask(
+                    attention_mask,
+                    cache_position,
+                ),
+            }
+        elif getattr(self.decoder, "has_sliding_layers", False):
             attention_masks: Any = {
                 "full_attention": full_mask,
                 "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
@@ -488,7 +496,9 @@ class LlamaLikePartialRunner:
             layer = self.layers[idx]
             attention_mask = state.attention_masks
             if isinstance(attention_mask, dict):
-                attention_type = getattr(layer, "attention_type", "full_attention")
+                attention_type = getattr(layer, "attention_type", None)
+                if attention_type is None:
+                    attention_type = getattr(layer, "layer_type", "full_attention")
                 if attention_type not in attention_mask:
                     raise ValueError(f"No prepared attention mask for type {attention_type!r}.")
                 attention_mask = attention_mask[attention_type]
