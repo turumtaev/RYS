@@ -1,313 +1,305 @@
-# RYS
+# Benchmark-Conditioned Suffix Beam Search for RYS
 
-RYS is a small reproducibility repo for relayering experiments on decoder LLMs.
+This fork experiments with a more incremental way to search for useful layer
+repetitions in decoder language models. It builds on Daniel Han-Chen's
+[RYS repository](https://github.com/dnhkng/RYS) and the experiments described in
+[RYS Part II](https://dnhkng.github.io/posts/rys-ii/).
 
-The core idea is simple: duplicate part of a model's existing layer path without changing any weights.
-A standard single-block configuration is written as `(i, j)`:
+The upstream project searches for a fixed relayered architecture by evaluating
+complete repeated blocks and composing the strongest blocks with beam search.
+This fork searches for the same kind of static architecture, but grows it one
+model boundary at a time and reuses benchmark hidden states across expansions.
+It is not token-level beam search and it does not change the architecture during
+normal inference.
 
-- run layers `0 .. j-1`
-- then jump back and run layers `i .. N-1`
-- so layers `i .. j-1` are traversed twice
+The implementation, tests, GPU launchers, and corrected evaluation code are on
+this branch. The longer chronological design log is in
+[`SUFFIX_BEAM_SEARCH.md`](SUFFIX_BEAM_SEARCH.md).
 
-Baseline is `(0,0)`, which means no duplication.
+## Method
 
-This repo contains the pieces needed to reproduce the main experimental workflows:
+Let the original decoder contain layers `0 .. N-1`. At boundary `k`, every beam
+candidate represents an execution path through layer `k-1` and owns the hidden
+states produced by that prefix for every benchmark example. The search expands
+the candidate with:
 
-- scanner for full `(i, j)` sweeps
-- fixed Math and EQ probe sets
-- multi-block beam search
-- XGBoost surrogate pipeline
-- model exporter for writing relayered Hugging Face checkpoints
-- heatmap and balanced Math+EQ analysis code
+1. a plain continuation through layer `k`; or
+2. layer `k` followed by a replay of a recent contiguous block `m .. k`.
 
-It does not include the private historical runs, blog drafts, ad hoc notebooks, or dataset generation/calibration code.
+The replay start `m` is restricted by `--replay-window`. For example, at layer
+`k=3`, replaying `(1,4)` produces the partial path
+`0,1,2,3,1,2,3`. Block ends are exclusive throughout the codebase.
 
-## Repo Contents
+Each child is completed with the unchanged suffix `k+1 .. N-1` and scored on
+the benchmark. The implementation keeps a separate beam for every exact
+extra-layer budget, which prevents all candidates from spending their replay
+budget in early layers.
 
-- `datasets/`
-  - `math_16.json`
-  - `math_120.json`
-  - `eq_16.json`
-  - `eq_140.json`
-  - `manifest.json`
-- `src/core/`
-  - config parsing
-  - layer-list expansion
-  - relayer wrappers for dense and MoE-style stacks
-- `src/workers/`
-  - Math and EQ benchmark workers
-  - queue handling
-  - model loading helpers
-- `src/utils/`
-  - balanced Math+EQ analysis
-  - heatmap helpers
-  - surrogate utilities
-- `scripts/`
-  - sweep setup
-  - ExLlama workers
-  - beam search
-  - surrogate pipeline
-  - repeat-sweep helpers
-- `hf_export/`
-  - checkpoint export
-  - HF upload helper
-  - Colab notebook
+### Reused computation
 
-## Probe Sets
+The search keeps candidate boundary hidden states in CPU RAM. At every boundary
+it:
 
-This repo ships the fixed benchmark subsets used by the public workflow:
+1. restores each parent's hidden states after layer `k-1`;
+2. runs layer `k` and each permitted local replay;
+3. runs the common remaining suffix to calculate proxy scores;
+4. prunes independently inside each replay-budget beam; and
+5. offloads only the surviving child boundary states for the next step.
 
-- `datasets/math_16.json`
-- `datasets/math_120.json`
-- `datasets/eq_16.json`
-- `datasets/eq_140.json`
+This avoids recomputing every retained prefix from token IDs. A two-pass
+implementation also avoids storing the full branching factor: score all
+children first, then recompute and retain only the winners' short expansions.
 
-Important notes:
+### Search objective
 
-- `eq_16` and `eq_140` are first-pass-only EQ subsets.
-- `datasets/manifest.json` records provenance and checksums.
-- The file named `eq_140.json` currently contains `139` records; this is documented in the manifest and preserved for continuity with the original naming.
+Running full autoregressive Math and EQ evaluation for every child is too
+expensive. Search therefore uses a deterministic teacher-forced proxy:
 
-## Setup
+- Math scores the log-probability of every token in the canonical numeric answer
+  and the answer terminator.
+- EQ scores only the four numeric answer spans and each following delimiter or
+  terminator. Emotion names and formatting are present as context but do not
+  contribute to the score.
+- Math and EQ are averaged with equal weight.
 
-Python uses `uv`:
+Scoring the terminator matters because otherwise a configuration can maximize
+the probability of the correct numeric prefix while continuing to generate
+more digits. The final shortlist is always rerun with the original
+generation-based Math and EQ metrics.
 
-```bash
-uv sync
-```
+## What Is Implemented
 
-For ExLlama scanning you also need:
+- Teacher-forced Math and masked EQ objectives, including answer termination.
+- Partial execution of Llama/Qwen-style decoder stacks exposing a layer list.
+- Qwen3.5 support, including its hybrid attention and required cache positions.
+- Arbitrary repeated layer paths without rebuilding model weights for proxy
+  scoring.
+- Boundary hidden-state caching in CPU RAM and suffix-only child evaluation.
+- Budget-indexed beam search with local replay windows and replay-layer caps.
+- Length-sorted, padding-aware benchmark batching infrastructure.
+- Exact generation-based evaluation of search candidates and explicit configs.
+- Corrected full-scale EQ references in Hugging Face and ExLlama workers.
+- Mac CPU/MPS smoke tests and reproducible Qwen3.5-27B H100 launch scripts.
 
-- a local `exllamav3` checkout
-- an EXL3-compatible model directory
-- CUDA-capable hardware if you want real scan throughput
+## Qwen3.5-27B Experiment
 
-Set:
+The main run used `Qwen/Qwen3.5-27B-FP8` on one 80 GB H100.
 
-```bash
-export EXLLAMAV3_PATH=/path/to/exllamav3
-```
+| Setting | Value |
+|---|---:|
+| Proxy examples | 16 Math + 16 EQ |
+| Model layers | 64 |
+| Beam width | 2 per exact replay budget |
+| Replay window | 12 layers |
+| Maximum extra layers | 12 |
+| Proxy batch size | 1 |
+| Proxy search time | 36,958 s (10.27 h) |
+| Peak CUDA allocated | 29.9 GiB |
+| Peak CUDA reserved | 42.5 GiB |
+| Peak CPU boundary cache | 3.54 GiB |
+| Exact comparison | 120 Math + 139 EQ |
 
-## Quick Start
+The file remains named `eq_140.json` for compatibility, but contains 139
+examples. The large benchmark extends the small probes; it is a broader
+validation set, not a strictly disjoint holdout.
 
-### 1. Create a full `(i, j)` sweep queue
-
-Example for a 64-layer model:
-
-```bash
-uv run python scripts/init_queue.py \
-  --num-layers 64 \
-  --queue-file results/demo/queue.json \
-  --results-file results/demo/combined_results.pkl
-```
-
-This writes canonical layer-list configs, including the baseline `(0,0)`.
-
-### 2. Run the ExLlama combined scanner
-
-This is the main fast scan path in the public repo. It loads the EXL3 model once and scores Math and EQ in one mixed pass per config.
+Run the same search with:
 
 ```bash
-uv run python scripts/run_exllama_math_eq_combined_worker.py \
-  --queue-file results/demo/queue.json \
-  --combined-results-file results/demo/combined_results.pkl \
-  --math-results-file results/demo/math_results.pkl \
-  --eq-results-file results/demo/eq_results.pkl \
-  --model-dir /path/to/model.exl3 \
-  --math-dataset-path datasets/math_16.json \
-  --eq-dataset-path datasets/eq_16.json \
-  --math-max-new 64 \
-  --eq-max-new 64 \
-  --auto-cache
+./scripts/run_qwen35_search_a.sh
 ```
 
-### 3. Analyze and render heatmaps
+Rerun the baseline, the author's four published large-set Pareto configs, and
+the 24 proxy candidates with:
 
 ```bash
-uv run python scripts/analyze_results.py \
-  --math-scores results/demo/math_results.pkl \
-  --eq-scores results/demo/eq_results.pkl \
-  --out-dir results/demo/analysis \
-  --num-layers 64
+./scripts/run_qwen35_large_comparison.sh
 ```
 
-This produces:
+Both launchers write resumable JSON results and logs outside the repository by
+default (`/workspace/results` and `/workspace/logs`). Local `results/` and log
+files are ignored by Git and are not part of the published source history.
 
-- top-ranked balanced configs
-- scatter plots
-- balanced Math+EQ heatmap artifacts
+## Results
 
-## Containerized ExLlama Run
+### Published RYS II table
 
-If you want a simple Docker entrypoint:
+RYS Part II reports this Pareto frontier for Qwen3.5-27B:
+
+| Config | Extra layers | Math delta | EQ delta | Delta sum |
+|---|---:|---:|---:|---:|
+| `(33,34)` | 1 (1.56%) | +0.0179 | +0.0945 | +0.1124 |
+| `(31,34)` | 3 (4.69%) | +0.0207 | +0.0972 | +0.1179 |
+| `(30,35)` | 5 (7.81%) | +0.0279 | +0.0979 | +0.1257 |
+| `(26,34)` | 8 (12.50%) | +0.0279 | +0.1009 | +0.1288 |
+
+Those published EQ values were calculated against `reference_answer`, whose
+four scores are normalized together. The prompt asks the model for four
+independent scores on a 0-10 scale, and the datasets also contain the intended
+integer labels under `reference_answer_fullscale`. This fork changes exact EQ
+evaluation to use the full-scale references.
+
+Because the target changed, the published deltas above cannot be compared
+directly with the corrected results below. We reran the baseline, all four
+author configs, and our candidates through one common corrected evaluator.
+
+### Corrected common-evaluator comparison
+
+These are Hugging Face/Transformers results on all 120 Math and 139 EQ examples.
+`Average` is `(Math + EQ) / 2`; deltas are relative to the baseline from this
+same run.
+
+| Source | Config | Extra | Math | EQ | Average | Math delta | EQ delta |
+|---|---|---:|---:|---:|---:|---:|---:|
+| Baseline | none | 0 | 0.969651 | 0.647302 | 0.808476 | 0 | 0 |
+| RYS II | `(33,34)` | 1 | 0.989684 | 0.668975 | 0.829329 | +0.020033 | +0.021673 |
+| RYS II | `(31,34)` | 3 | 0.998575 | 0.670234 | 0.834405 | +0.028925 | +0.022932 |
+| RYS II | `(30,35)` | 5 | 0.995503 | 0.672482 | 0.833992 | +0.025852 | +0.025180 |
+| RYS II | `(26,34)` | 8 | 0.997037 | 0.672302 | 0.834669 | +0.027386 | +0.025000 |
+| This search, `beam_23` | `(43,44)` | 1 | **0.998712** | **0.669784** | **0.834248** | **+0.029061** | **+0.022482** |
+| This search, `beam_20` | `(43,44);(45,46);(47,48)` | 3 | 0.994119 | **0.676349** | **0.835234** | +0.024468 | **+0.029047** |
+
+The bold values compare configurations with the same number of extra layers.
+Under this corrected evaluator:
+
+- `beam_23` dominates the author's one-layer `(33,34)` config and improves
+  average score by `0.004919` at the same 1.56% overhead.
+- `beam_20` dominates the author's three-layer `(31,34)` config and improves
+  average score by `0.000829` at the same 4.69% overhead.
+- `beam_20` has the highest average among all 29 evaluated configs. It exceeds
+  the author's best corrected average, `(26,34)`, by `0.000564` while using
+  three rather than eight extra layers.
+- The corrected Pareto frontier over extra layers and average score is the
+  baseline, `beam_23`, and `beam_20`; none of the four author configs remains
+  on that frontier.
+
+This is a fair comparison among the configs in this rerun, but it is not an
+exact reproduction of the blog's absolute numbers. The blog used ExLlamaV3;
+this experiment used Hugging Face Transformers with BF16 computation over the
+FP8 checkpoint. Backend-level numerical differences can alter greedy outputs.
+The Math metric also awards partial credit, so a near-1 Math score is not the
+same as near-100% exact-match accuracy.
+
+## Setup and Validation
+
+Python dependencies are managed with [`uv`](https://docs.astral.sh/uv/):
 
 ```bash
-MODEL_DIR=/path/to/model.exl3 \
-EXLLAMAV3_PATH=/path/to/exllamav3 \
-./scripts/run_exllama_docker.sh
+uv sync --group dev
+uv run pytest
 ```
 
-Useful overrides:
-
-- `QUEUE_FILE`
-- `COMBINED_RESULTS_FILE`
-- `MATH_RESULTS_FILE`
-- `EQ_RESULTS_FILE`
-- `MATH_DATASET`
-- `EQ_DATASET`
-- `DEVICE`
-- `RESERVE_PER_DEVICE`
-- `USE_PER_DEVICE`
-
-## Beam Search
-
-Beam search composes multiple repeated blocks and benchmarks only unseen configs.
-
-Example:
+The focused test suite covers target masks, teacher-forced scoring, partial and
+repeated paths, cached versus uncached search, budget-indexed pruning, batching,
+and export utilities. A real model diagnostic is also available:
 
 ```bash
-uv run python scripts/beam_search.py \
-  --model-path /path/to/hf-model \
-  --num-layers 64 \
-  --seed-math-results results/demo/math_results.pkl \
-  --seed-eq-results results/demo/eq_results.pkl \
-  --math-dataset-path datasets/math_16.json \
-  --eq-dataset-path datasets/eq_16.json \
-  --work-dir results/demo/beam-search
+uv run python scripts/check_partial_runner.py \
+  --model-path Qwen/Qwen3.5-0.8B \
+  --device-map mps \
+  --torch-dtype float32 \
+  --no-local-files-only
 ```
 
-Notes:
-
-- beam search uses the Hugging Face worker path in `src/workers/`
-- seed pickles should come from an already measured single-block scan
-- state under `--work-dir` is resume-friendly
-- for small local runs on Apple Silicon, pass `--device-map mps --torch-dtype float32 --dataset-limit 4`
-- when Math and EQ share the same device map, the launcher serializes the workers instead of running them concurrently
-
-## Surrogate Pipeline
-
-The surrogate uses per-layer repeat counts as features. Predicted scores are only for ranking candidates; the final benchmark scores must be measured.
-
-### Train
+For a small end-to-end search:
 
 ```bash
-uv run python scripts/train_surrogate.py \
-  --single-block-math-results results/demo/math_results.pkl \
-  --single-block-eq-results results/demo/eq_results.pkl \
-  --beam-math-results results/demo/beam-search/beam_math_results.pkl \
-  --beam-eq-results results/demo/beam-search/beam_eq_results.pkl \
-  --out-dir results/demo/surrogate \
-  --num-layers 64
+HF_HOME=.hf-cache uv run python scripts/beam_search.py \
+  --model-path Qwen/Qwen2.5-0.5B-Instruct \
+  --device-map mps \
+  --torch-dtype float16 \
+  --dataset-limit 4 \
+  --beam-width 2 \
+  --replay-window 1 \
+  --max-extra-layers 2 \
+  --exact-top-k 2 \
+  --output results/mac_smoke/suffix_search.json
 ```
 
-### Generate candidates
+Use `--device-map cpu` on a machine without MPS or CUDA. See
+`scripts/beam_search.py --help` for separate search and exact-validation
+datasets, offsets, generation limits, and cache controls.
 
-```bash
-uv run python scripts/generate_candidates.py \
-  --num-layers 64 \
-  --max-extra-layers 12 \
-  --count 2000000 \
-  --output-csv results/demo/surrogate/candidates.csv
+## Known Limitations and Unfinished Work
+
+### Cross-example batching on Qwen3.5
+
+The production search used `--benchmark-batch-size 1`. Batch size 2 initially
+produced `NaN` EQ proxy scores because cached short sequences were restored into
+padded rows incorrectly. Fixing that bug removed the NaNs, but variable-length
+batch scores still differed from batch-1 scores at the first boundary. Sorting
+by length did not help enough because almost every EQ prompt has a distinct
+length. Qwen3.5 therefore defaults to batch 1 until packed-sequence or another
+padding-independent implementation is validated.
+
+Exact generation also uses batch size 1 for the recorded comparison. Correctness
+was preferred over throughput.
+
+### Sibling-candidate batching
+
+An alternative batches the children of one parent after their local replays,
+because all siblings have equal sequence length and run the same suffix. The
+implementation is preserved on branch `codex/sibling-batching-wip` at commit
+`92e3567`. It was not used for the final search: sibling count grows to 13 with
+a replay window of 12, and the longest EQ sequences made peak-memory behavior
+too risky for the single rented 80 GB GPU. The branch is experimental and its
+small numerical differences also need ranking-stability tests.
+
+### Nested replay paths
+
+The current search appends a replay to the path already fixed in the prefix. It
+can construct:
+
+```text
+1,2,3,1,2,3
 ```
 
-### Score candidates and build a top-k config file
+but it cannot discover a replay inside an earlier replay, such as:
 
-```bash
-uv run python scripts/score_candidates.py \
-  --model-dir results/demo/surrogate \
-  --candidates-file results/demo/surrogate/candidates.csv \
-  --output-csv results/demo/surrogate/top_scored.csv \
-  --top-k 100
-
-uv run python scripts/build_topk_config.py \
-  --top-candidates-csv results/demo/surrogate/top_scored.csv \
-  --num-layers 64 \
-  --output-config results/demo/surrogate/top100.config
+```text
+1,2,3,1,2,1,2,3
 ```
 
-Then benchmark those configs with the same Math/EQ harness used elsewhere.
+A generalized search should store both a prefix and a pending suffix for every
+candidate. At boundary `k`, if executing `k`, then replaying `k-2,k-1,k`, then
+the old suffix gives a better score, retain it as:
 
-## Model Export
-
-`hf_export` writes a relayered Hugging Face checkpoint with the duplicated layers physically materialized into the safetensor shards.
-
-Single block:
-
-```bash
-uv run python -m hf_export.export_model \
-  --source /path/to/base-model \
-  --source-repo-id some/model \
-  --output exports/model-block-30-34 \
-  --blocks "30,34"
+```text
+prefix = old_prefix + [k]
+suffix = [k-2, k-1, k] + old_suffix
 ```
 
-Multi-block:
+The scheduler would process candidates with the smallest unfinished prefix
+boundary first. This turns a replay into editable future structure instead of
+permanently flattening it into the completed prefix. It needs a new candidate
+state, deduplication rule, budget accounting, cache policy, and tests before it
+can replace the current boundary-by-boundary algorithm.
 
-```bash
-uv run python -m hf_export.export_model \
-  --source /path/to/base-model \
-  --source-repo-id some/model \
-  --output exports/model-31_34__43_45 \
-  --blocks "31,34;43,45"
-```
+### Evaluation and search quality
 
-Upload:
+- The proxy is useful for pruning but did not rank the exact winner first on the
+  16+16 search set; exact shortlist validation remains mandatory.
+- The 16+16 proxy set was selected for speed, not statistical power.
+- Hyperparameters were chosen pragmatically rather than with a full sweep on
+  Qwen3.5-27B.
+- The corrected author comparison should also be reproduced with ExLlamaV3 if
+  exact agreement with the original execution backend is required.
+- Raw GPU logs and result JSON are intentionally not committed. The launchers,
+  exact configs, reported metrics, and source commit are preserved for reruns.
 
-```bash
-export HF_TOKEN=...
+## Repository Layout
 
-uv run python -m hf_export.upload_to_hf \
-  --folder exports/model-block-30-34 \
-  --repo-id your-name/model-block-30-34
-```
+- `scripts/beam_search.py`: benchmark-conditioned suffix beam search.
+- `scripts/evaluate_exact_configs.py`: generation-score explicit layer paths.
+- `scripts/run_qwen35_*.sh`: recorded H100 experiment launchers.
+- `scripts/check_partial_runner.py`: full-model versus partial-runner diagnostic.
+- `src/workers/model_utils.py`: model loading, partial execution, and proxy input
+  construction.
+- `src/workers/math_worker.py`: Math prompts, proxy targets, generation, scoring.
+- `src/workers/eq_worker.py`: EQ prompts, numeric masks, generation, scoring.
+- `tests/test_surrogate_utils.py`: suffix-search and scoring tests.
+- `SUFFIX_BEAM_SEARCH.md`: historical design decisions and experiment log.
 
-The export manifest is written to `rys_export_manifest.json`.
-
-A minimal Colab notebook is available at:
-
-- `hf_export/colab/export_upload_minimal.ipynb`
-
-## Heatmaps
-
-The reusable plotting helpers live in `src/utils/heatmaps.py`.
-
-For standard `(i, j)` scans, the normal entrypoint is:
-
-```bash
-uv run python scripts/analyze_results.py \
-  --math-scores results/demo/math_results.pkl \
-  --eq-scores results/demo/eq_results.pkl \
-  --out-dir results/demo/analysis \
-  --num-layers 64
-```
-
-For per-layer repeat sweeps:
-
-```bash
-uv run python scripts/plot_repeat_heatmaps.py \
-  --results-file results/demo/repeatx8_math_results.pkl \
-  --manifest-file results/demo/repeatx8_manifest.json \
-  --out-dir results/demo/repeatx8_heatmaps
-```
-
-## Current Assumptions and Limits
-
-- The public scan path is ExLlama-first.
-- Beam search uses the Hugging Face worker path rather than ExLlama.
-- This repo assumes decoder-layer architectures; unsupported architectures should fail explicitly.
-- The HF exporter currently detects decoder stacks under:
-  - `model.language_model.layers.`
-  - `model.layers.`
-  - `language_model.layers.`
-- Dataset generation and recalibration are intentionally out of scope here.
-
-## Suggested Reproduction Path
-
-If you are starting from scratch, do this in order:
-
-1. run a small `(i, j)` scan with `math_16 + eq_16`
-2. inspect the heatmaps and top balanced configs
-3. run beam search seeded from the single-block scan
-4. train the surrogate on measured configs and benchmark its top candidates
-5. rerun the strongest candidates on `math_120 + eq_140`
-6. export any final variants you want to share
+For the original single-block scanner, multi-block beam search, surrogate
+pipeline, exporter, and upstream usage instructions, see
+[dnhkng/RYS](https://github.com/dnhkng/RYS).
