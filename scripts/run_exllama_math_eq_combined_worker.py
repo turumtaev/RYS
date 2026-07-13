@@ -409,7 +409,7 @@ def main() -> None:
             {
                 "task": "eq",
                 "qid": qid,
-                "reference": sample.get("reference_answer", sample.get("reference_answer_fullscale", {})),
+                "reference": sample.get("reference_answer_fullscale", sample.get("reference_answer", {})),
             }
         )
 
