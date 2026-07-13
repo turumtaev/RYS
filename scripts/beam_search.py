@@ -69,6 +69,7 @@ class ProxyBatch:
     qids: tuple[str, ...]
     input_ids: torch.Tensor
     attention_mask: torch.Tensor
+    position_ids: torch.Tensor
     score_mask: torch.Tensor
     sequence_lengths: tuple[int, ...]
 
@@ -214,6 +215,7 @@ def _dataset_item_batches(
     items = sorted(
         dataset.items(),
         key=lambda item: int(item[1]["input_ids"].shape[1]),
+        reverse=True,
     )
     for start in range(0, len(items), batch_size):
         yield items[start : start + batch_size]
@@ -231,10 +233,13 @@ def _collate_proxy_batch(
     *,
     device: torch.device,
     pad_token_id: int,
+    padding_side: str = "right",
 ) -> ProxyBatch:
-    """Right-pad pretokenized examples and build a full-sequence score mask."""
+    """Pad pretokenized examples and build position and full-sequence score masks."""
     if not items:
         raise ValueError("Cannot collate an empty proxy batch.")
+    if padding_side not in {"left", "right"}:
+        raise ValueError(f"Unsupported padding side: {padding_side!r}.")
     sequence_lengths = tuple(int(cached["input_ids"].shape[1]) for _, cached in items)
     max_length = max(sequence_lengths)
     input_dtype = items[0][1]["input_ids"].dtype
@@ -258,24 +263,29 @@ def _collate_proxy_batch(
 
     for row, (_, cached) in enumerate(items):
         length = sequence_lengths[row]
+        offset = max_length - length if padding_side == "left" else 0
         ids = cached["input_ids"][0].to(device)
         attention = cached["attention_mask"][0].to(device)
-        input_ids[row, :length] = ids
-        attention_mask[row, :length] = attention
+        input_ids[row, offset : offset + length] = ids
+        attention_mask[row, offset : offset + length] = attention
         prompt_length = int(cached["prompt_length"])
         target_mask = cached.get("target_mask")
         if target_mask is None:
-            score_mask[row, prompt_length:length] = True
+            score_mask[row, offset + prompt_length : offset + length] = True
         else:
             target_mask = target_mask[0].to(device)
             if prompt_length + target_mask.numel() != length:
                 raise ValueError("prompt_length + target_mask length must equal sequence length.")
-            score_mask[row, prompt_length:length] = target_mask
+            score_mask[row, offset + prompt_length : offset + length] = target_mask
+
+    position_ids = attention_mask.long().cumsum(dim=-1) - 1
+    position_ids.masked_fill_(attention_mask == 0, 0)
 
     return ProxyBatch(
         qids=tuple(qid for qid, _ in items),
         input_ids=input_ids,
         attention_mask=attention_mask,
+        position_ids=position_ids,
         score_mask=score_mask,
         sequence_lengths=sequence_lengths,
     )
@@ -400,8 +410,8 @@ def _restore_parent_batch(
             raise ValueError("Boundary 0 must expand the empty baseline prefix.")
         return initial_state
 
-    hidden_states = torch.zeros_like(initial_state.hidden_states)
-    for row, (qid, length) in enumerate(zip(batch.qids, batch.sequence_lengths)):
+    hidden_states = torch.empty_like(initial_state.hidden_states)
+    for row, qid in enumerate(batch.qids):
         example_key = (metric, qid)
         try:
             cpu_hidden = parent_cache[parent_path][example_key]
@@ -409,7 +419,12 @@ def _restore_parent_batch(
             raise KeyError(
                 f"Missing parent boundary state for path={parent_path}, example={example_key}."
             ) from exc
-        hidden_states[row, :length] = cpu_hidden[0].to(device)
+        if cpu_hidden.shape[1] != hidden_states.shape[1]:
+            raise ValueError(
+                "Cached padded length changed between boundaries. "
+                "Keep batch size and length-sorted batching fixed for a search run."
+            )
+        hidden_states[row : row + 1] = cpu_hidden.to(device)
     return replace(initial_state, hidden_states=hidden_states)
 
 
@@ -437,6 +452,7 @@ def score_cached_expansions(
     device: torch.device,
     batch_size: int,
     pad_token_id: int,
+    padding_side: str = "right",
 ) -> list[BeamCandidate]:
     """Score children from cached parent boundaries without rerunning prefixes."""
     grouped = _group_expansions_by_parent(expansions)
@@ -444,6 +460,7 @@ def score_cached_expansions(
         "math": {expansion.child.layer_path: [] for expansion in expansions},
         "eq": {expansion.child.layer_path: [] for expansion in expansions},
     }
+    sibling_batch_size = max(len(parent_expansions) for parent_expansions in grouped.values())
 
     with torch.inference_mode():
         for metric, dataset in (("math", math_dataset), ("eq", eq_dataset)):
@@ -452,10 +469,12 @@ def score_cached_expansions(
                     items,
                     device=device,
                     pad_token_id=pad_token_id,
+                    padding_side=padding_side,
                 )
                 initial_state = runner.prepare(
                     input_ids=batch.input_ids,
                     attention_mask=batch.attention_mask,
+                    position_ids=batch.position_ids,
                 )
                 for parent_path, parent_expansions in grouped.items():
                     parent_state = _restore_parent_batch(
@@ -468,25 +487,47 @@ def score_cached_expansions(
                         device=device,
                     )
                     plain_state = runner.run_layer_indices(parent_state, (layer_idx,))
-                    for expansion in parent_expansions:
-                        child_state = _run_local_expansion(
+                    child_states = [
+                        _run_local_expansion(
                             runner,
                             plain_state,
                             expansion,
                             layer_idx=layer_idx,
                         )
-                        final_state = runner.run_range(
-                            child_state,
-                            layer_idx + 1,
-                            runner.num_layers,
-                        )
-                        logits = runner.logits(final_state)
+                        for expansion in parent_expansions
+                    ]
+                    child_states.extend(
+                        [child_states[-1]] * (sibling_batch_size - len(child_states))
+                    )
+                    sibling_state = runner.stack_states(child_states)
+                    final_state = runner.run_range(
+                        sibling_state,
+                        layer_idx + 1,
+                        runner.num_layers,
+                    )
+                    logits = runner.logits(final_state)
+                    sibling_batch = replace(
+                        batch,
+                        qids=batch.qids * sibling_batch_size,
+                        input_ids=batch.input_ids.repeat(sibling_batch_size, 1),
+                        attention_mask=batch.attention_mask.repeat(
+                            sibling_batch_size, 1
+                        ),
+                        position_ids=batch.position_ids.repeat(sibling_batch_size, 1),
+                        score_mask=batch.score_mask.repeat(sibling_batch_size, 1),
+                        sequence_lengths=batch.sequence_lengths * sibling_batch_size,
+                    )
+                    sibling_scores = _score_proxy_batch_logits(
+                        logits=logits,
+                        batch=sibling_batch,
+                        reduction=reduction,
+                    )
+                    examples_per_child = len(batch.qids)
+                    for child_idx, expansion in enumerate(parent_expansions):
+                        start = child_idx * examples_per_child
+                        end = start + examples_per_child
                         metric_scores[metric][expansion.child.layer_path].extend(
-                            _score_proxy_batch_logits(
-                                logits=logits,
-                                batch=batch,
-                                reduction=reduction,
-                            )
+                            sibling_scores[start:end]
                         )
 
     scored: list[BeamCandidate] = []
@@ -521,6 +562,7 @@ def materialize_boundary_cache(
     device: torch.device,
     batch_size: int,
     pad_token_id: int,
+    padding_side: str = "right",
 ) -> BoundaryCache:
     """Recreate only winning local expansions and offload their states to CPU."""
     grouped = _group_expansions_by_parent(expansions)
@@ -534,10 +576,12 @@ def materialize_boundary_cache(
                     items,
                     device=device,
                     pad_token_id=pad_token_id,
+                    padding_side=padding_side,
                 )
                 initial_state = runner.prepare(
                     input_ids=batch.input_ids,
                     attention_mask=batch.attention_mask,
+                    position_ids=batch.position_ids,
                 )
                 for parent_path, parent_expansions in grouped.items():
                     parent_state = _restore_parent_batch(
@@ -557,11 +601,9 @@ def materialize_boundary_cache(
                             expansion,
                             layer_idx=layer_idx,
                         )
-                        for row, (qid, length) in enumerate(
-                            zip(batch.qids, batch.sequence_lengths)
-                        ):
+                        for row, qid in enumerate(batch.qids):
                             next_cache[expansion.child.layer_path][(metric, qid)] = (
-                                child_state.hidden_states[row : row + 1, :length]
+                                child_state.hidden_states[row : row + 1]
                                 .detach()
                                 .to("cpu")
                                 .contiguous()
@@ -633,6 +675,8 @@ def _write_progress(
     elapsed_seconds: float,
     boundary_cache_size: int,
     peak_boundary_cache_size: int,
+    peak_cuda_allocated: int | None,
+    peak_cuda_reserved: int | None,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     finished_proxy_search = layer_idx == final_layer
@@ -651,6 +695,7 @@ def _write_progress(
             "max_extra_layers": args.max_extra_layers,
             "dataset_limit_per_benchmark": args.dataset_limit,
             "benchmark_batch_size": args.benchmark_batch_size,
+            "padding_side": args.proxy_padding_side,
             "example_reduction": args.reduction,
             "combined_score": "(math_score + eq_score) / 2",
             "requested_final_layer": final_layer,
@@ -658,6 +703,12 @@ def _write_progress(
             "elapsed_seconds": elapsed_seconds,
             "boundary_cache_mib": boundary_cache_size / 2**20,
             "peak_boundary_cache_mib": peak_boundary_cache_size / 2**20,
+            "peak_cuda_allocated_mib": (
+                peak_cuda_allocated / 2**20 if peak_cuda_allocated is not None else None
+            ),
+            "peak_cuda_reserved_mib": (
+                peak_cuda_reserved / 2**20 if peak_cuda_reserved is not None else None
+            ),
         },
         "beam": [
             _candidate_json(candidate, layer_idx=layer_idx, num_layers=model_metadata["num_layers"])
@@ -688,6 +739,8 @@ def _write_exact_validation(
     eq_max_new: int,
     batch_size: int,
     dataset_offset: int,
+    math_dataset_path: str,
+    eq_dataset_path: str,
 ) -> None:
     payload = json.loads(output_path.read_text())
     proxy_order = [
@@ -705,6 +758,8 @@ def _write_exact_validation(
         "eq_max_new": eq_max_new,
         "batch_size": batch_size,
         "dataset_offset": dataset_offset,
+        "math_dataset_path": math_dataset_path,
+        "eq_dataset_path": eq_dataset_path,
         "examples_per_benchmark": len(results[0]["math_responses"]),
         "proxy_order": proxy_order,
         "exact_order": exact_order,
@@ -714,6 +769,28 @@ def _write_exact_validation(
     temporary = output_path.with_suffix(output_path.suffix + ".tmp")
     temporary.write_text(json.dumps(payload, indent=2) + "\n")
     temporary.replace(output_path)
+
+
+def default_benchmark_batch_size(device: torch.device, model_type: str | None) -> int:
+    """Choose a correctness-first proxy batch size for the loaded architecture."""
+    if device.type != "cuda" or model_type == "qwen3_5":
+        return 1
+    return 8
+
+
+def resolve_exact_dataset_selection(
+    args: argparse.Namespace,
+) -> tuple[str, str, int | None]:
+    """Resolve exact datasets without truncating explicitly separate validation files."""
+    math_path = args.exact_math_dataset_path or args.math_dataset_path
+    eq_path = args.exact_eq_dataset_path or args.eq_dataset_path
+    limit = args.exact_dataset_limit
+    uses_separate_dataset = bool(
+        args.exact_math_dataset_path or args.exact_eq_dataset_path
+    )
+    if limit is None and not uses_separate_dataset:
+        limit = args.dataset_limit
+    return math_path, eq_path, limit
 
 
 def run_exact_validation(
@@ -809,6 +886,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--math-dataset-path", default="datasets/math_16.json")
     parser.add_argument("--eq-dataset-path", default="datasets/eq_16.json")
+    parser.add_argument(
+        "--exact-math-dataset-path",
+        default=None,
+        help="Math dataset used only for exact validation (default: search Math dataset).",
+    )
+    parser.add_argument(
+        "--exact-eq-dataset-path",
+        default=None,
+        help="EQ dataset used only for exact validation (default: search EQ dataset).",
+    )
     parser.add_argument("--output", default="results/suffix-beam-search.json")
     parser.add_argument(
         "--beam-width",
@@ -910,8 +997,16 @@ def main() -> None:
     )
     runner = LlamaLikePartialRunner(model)
     device = model_input_device(model)
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
     if args.benchmark_batch_size is None:
-        args.benchmark_batch_size = 8 if device.type == "cuda" else 1
+        args.benchmark_batch_size = default_benchmark_batch_size(
+            device,
+            metadata.get("model_type"),
+        )
+    args.proxy_padding_side = (
+        "left" if metadata.get("model_type") == "qwen3_5" else "right"
+    )
     if tokenizer.pad_token_id is None:
         raise ValueError("Batched proxy scoring requires tokenizer.pad_token_id.")
     pad_token_id = int(tokenizer.pad_token_id)
@@ -957,6 +1052,7 @@ def main() -> None:
             device=device,
             batch_size=args.benchmark_batch_size,
             pad_token_id=pad_token_id,
+            padding_side=args.proxy_padding_side,
         )
         if layer_idx == 0:
             baseline = next(candidate for candidate in scored if not candidate.replays)
@@ -986,12 +1082,16 @@ def main() -> None:
                 device=device,
                 batch_size=args.benchmark_batch_size,
                 pad_token_id=pad_token_id,
+                padding_side=args.proxy_padding_side,
             )
             boundary_cache_size = boundary_cache_bytes(parent_cache)
             peak_boundary_cache_size = max(
                 peak_boundary_cache_size,
                 boundary_cache_size,
             )
+        # Sibling batches grow through the replay window. Release workspaces
+        # cached for the previous batch shape before the next boundary.
+        maybe_empty_cache(device)
         elapsed = time.monotonic() - started
         best = beam[0]
         print(
@@ -1012,22 +1112,26 @@ def main() -> None:
             elapsed_seconds=elapsed,
             boundary_cache_size=boundary_cache_size,
             peak_boundary_cache_size=peak_boundary_cache_size,
+            peak_cuda_allocated=(
+                torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None
+            ),
+            peak_cuda_reserved=(
+                torch.cuda.max_memory_reserved(device) if device.type == "cuda" else None
+            ),
         )
 
     beam = flatten_budget_beams(beam_by_budget)
     if args.exact_top_k > 0:
         if baseline_proxy_score is None:
             raise RuntimeError("Baseline proxy score was not captured.")
-        exact_limit = args.exact_dataset_limit
-        if exact_limit is None:
-            exact_limit = args.dataset_limit
+        exact_math_path, exact_eq_path, exact_limit = resolve_exact_dataset_selection(args)
         exact_math_raw = _load_dataset(
-            args.math_dataset_path,
+            exact_math_path,
             exact_limit,
             offset=args.exact_dataset_offset,
         )
         exact_eq_raw = _load_dataset(
-            args.eq_dataset_path,
+            exact_eq_path,
             exact_limit,
             offset=args.exact_dataset_offset,
         )
@@ -1052,6 +1156,8 @@ def main() -> None:
             eq_max_new=args.eq_max_new,
             batch_size=args.exact_batch_size,
             dataset_offset=args.exact_dataset_offset,
+            math_dataset_path=exact_math_path,
+            eq_dataset_path=exact_eq_path,
         )
 
     print(f"Saved {len(beam)} candidates to {output_path}")

@@ -563,7 +563,265 @@ examples for proxy search and the next four for exact validation, so it must be
 confirmed on a fresh test split before treating the improvement as evidence of
 generalization.
 
-### CPU activation-cache profile
+### Untouched Mac test
+
+Status: complete
+
+The fixed proxy shortlist was evaluated on examples `8-11`, which were not used
+for proxy search or hyperparameter selection:
+
+| Candidate | Replays | Exact score |
+|---|---|---:|
+| Baseline | none | `0.519584` |
+| Selected | `(7,8);(11,12);(15,16)` | **`0.554819`** |
+
+The absolute improvement was `+0.035235`. This is positive but substantially
+smaller than the `+0.190426` improvement on the tuning validation split. The
+0.5B experiment therefore validates the implementation and search signal, not
+a general claim about relayering quality.
+
+## 12. GPU Experiment Design
+
+### Author hardware and workflow
+
+The original Qwen2-72B discovery in RYS Part I was explicitly performed on two
+RTX 4090s. RYS Part II describes the author's newer machine as two GH200
+superchips with H100 GPUs and `192 GB` total HBM3, and says that most of the
+newer scanning used FP8 models on that Hopper system. It does not establish
+that every Qwen3.5 experiment required or occupied both GH200 GPUs. The Part II
+search used the 16-question Math and EQ probes, then re-measured shortlisted
+candidates on Math120 and EQ140 (actually 139 EQ examples).
+
+Qwen3.5-27B has 64 layers, hidden size 5120, and a hybrid stack containing
+Gated DeltaNet and attention layers. Qwen3.5-0.8B has the same hybrid pattern at
+24 layers and hidden size 1024, making it the appropriate local architecture
+gate before renting a GPU.
+
+Local Qwen3.5-0.8B MPS validation is complete:
+
+- native and partial-runner logits were bit-identical across the ordinary
+  24-layer path (`max_abs = 0`)
+- logits from both paths were finite
+- a cached budget-indexed replay smoke completed through boundary 4
+- replay paths crossed both DeltaNet and attention layers successfully
+
+The local fallback uses the slower PyTorch DeltaNet implementation because the
+optional Flash Linear Attention and causal-conv1d packages are not installed.
+That affects speed, not the equivalence result.
+
+A complete small search also passed end to end using four proxy examples and
+the next four examples for exact validation:
+
+| Candidate | Replays | Math | EQ | Combined |
+|---|---|---:|---:|---:|
+| Baseline | none | `0.220730` | `0.570476` | `0.395603` |
+| Proxy winner | `(13,14);(19,20);(20,21)` | `0.220730` | `0.625476` | **`0.423103`** |
+
+Search settings were width `2` per budget, window `1`, and budget `4`. The
+search took `509.1s` and peaked at `64.8 MiB` of activation cache. The exact
+improvement was `+0.0275`, entirely from EQ; the other three proxy-shortlisted
+candidates regressed. This is enough to validate the complete Qwen3.5 path, but
+not enough data to infer optimal 27B search parameters.
+
+### Why the author's beam parameters do not map directly
+
+The author's beam width `24` is a single global beam. Our current width is per
+exact replay-budget cell, so the retained count is approximately:
+
+```text
+1 + beam_width_per_budget * max_extra_layers
+```
+
+Using width `24` and budget `56` would retain up to `1,345` candidates, not 24.
+It would also require roughly `845 GiB` of CPU activation cache if search were
+run on all Math120/EQ140 tokens. We should reuse the scale of the author's
+search, not copy numerically incompatible flags.
+
+For Qwen3.5-27B, the initial analogous configuration is:
+
+- width `2` per budget
+- replay window `12`, covering the author's useful 11-layer block
+- maximum extra layers `12`, approximately the author's practical 20% overhead
+- up to 25 retained candidates across budget cells, close to global width 24
+
+The author's cap of 56 was a safety ceiling, not evidence that 56 extra layers
+is a good initial budget. Test larger budgets only after the first search.
+
+### Recommended Vast.ai machine
+
+Use one on-demand H100 SXM 80 GB for the first campaign:
+
+- GPU: `1x H100 SXM 80GB` (H100 PCIe 80 GB is an acceptable cheaper fallback)
+- system RAM: at least `128 GB`; prefer `192-256 GB` if the premium is small
+- CPU: at least 16 effective cores
+- disk: `200 GB` local SSD, preferably at least `1 GB/s`
+- CUDA: `12.8` or newer
+- download: at least `500 Mbps`
+- reliability: at least `98%`, verified host, direct SSH port
+- rental type: on-demand for compatibility and the first full run
+
+Avoid 24 GB consumer GPUs: the FP8 checkpoint plus activations and logits does
+not leave safe headroom. Avoid multi-GPU offers initially because partial-layer
+execution with a sharded model has not been validated. H200 is suitable but
+unnecessary unless its price is close to H100.
+
+Use this Docker image:
+
+```text
+pytorch/pytorch:2.11.0-cuda12.8-cudnn9-devel
+```
+
+It matches the repository's locked PyTorch/CUDA versions. In the Vast.ai GUI,
+select SSH launch mode, enable direct SSH, allocate 200 GB disk, and use the
+image above. Do not select a vLLM or SGLang template: the search needs direct
+access to intermediate layer states through Hugging Face Transformers.
+
+Actual rented instance:
+
+- one H100 SXM 80 GB at `$2.208/hour`
+- CUDA driver capability 13.2; PyTorch `2.11.0+cu128`
+- 2 TiB system RAM and 200 GB container disk
+- `flash-linear-attention==0.5.1` / `fla-core==0.5.1`
+- all 26 current tests pass locally; all 24 tests present at initial remote
+  setup passed on the instance
+
+### Staged paid experiment
+
+#### Gate 1: environment and architecture compatibility
+
+Status: passed
+
+1. Run the complete unit test suite.
+2. Load `Qwen/Qwen3.5-27B-FP8` on one GPU with BF16 activations.
+3. Repeat the native-versus-partial comparison over `range(64)` to verify that
+   FP8 loading and the CUDA fast path preserve the local 0.8B result.
+4. Require finite logits and close proxy scores before any replay search.
+5. Run a four-boundary search with two examples, width 2, window 2, budget 2.
+
+Stop immediately if native/partial equivalence fails. Qwen3.5's DeltaNet layer
+calling convention must then be implemented and tested before renting again.
+
+Observed result: Qwen3.5-27B-FP8 loaded in about five seconds, exposed 64 text
+layers, produced finite logits, and matched native execution exactly
+(`max_abs = 0`) over the full ordinary layer path.
+
+#### Gate 2: CUDA profiling
+
+Status: passed; benchmark examples remain batch size 1
+
+Run the same capped search with benchmark batch sizes `1`, `2`, `4`, and `8`.
+Record wall time, peak VRAM, peak CPU cache, and CPU-to-GPU transfer time. Select
+the fastest batch size that has at least 10 GB of VRAM headroom. This replaces
+the current unverified CUDA default of 8.
+
+Observed results:
+
+- FLA's first Triton invocation compiled kernels in about 37 seconds; warm
+  five-boundary Qwen3.5-0.8B search then took `4.2s`, versus `47.3s` before FLA
+- Qwen3.5-27B batch 1 used `29.9 GiB` allocated / `33.0 GiB` reserved VRAM
+- batch 2 produced `NaN` EQ proxy scores at boundary 1 despite ample VRAM
+- batches 4 and 8 were not run after the batch-2 correctness failure
+- Qwen3.5 now defaults to batch 1 on CUDA; other architectures retain CUDA
+  default batch 8
+
+The boundary-1 NaNs exposed a cache-padding bug: materialization cropped a short
+row to its real sequence length, then restoration recreated its padded tail as
+zero hidden vectors. Preserving the full padded hidden row removed the NaNs and
+reduced the profile from `48.8s` to `32.1s`. However, batch-2 scores already
+differed from batch 1 at boundary 0, proving that variable-length padding itself
+changes fused DeltaNet results. All 16 EQ examples have different token lengths,
+so equal-length batching would not accelerate the dominant workload. Qwen3.5
+therefore remains restricted to batch 1 until packed-sequence support exists.
+
+Batching across sibling architecture candidates is safe because every sibling
+for one benchmark example has the same sequence length, attention mask, and
+suffix boundary. The search now builds each sibling state independently, stacks
+the states, and runs their common suffix once. Parent groups are filled with
+discarded duplicate rows so every candidate at a boundary uses the same CUDA
+batch shape; this avoids comparing scores produced by different kernel shapes.
+
+On the four-example, four-boundary Qwen3.5-27B profile:
+
+- separate suffixes: `48.8s`, `29.9 GiB` peak allocated
+- sibling-batched suffixes: `39.5s`, `32.9 GiB` peak allocated
+- the best replay remained `(2,3)` and the top three candidates kept the same
+  order
+- proxy scores changed slightly because BF16/FP8 batched kernels use different
+  floating-point reduction paths; exact shortlist validation remains required
+- a 13-sibling suffix over the longest small-probe EQ sequence (`904` tokens)
+  produced finite logits at `34.1 GiB` peak allocated / `37.8 GiB` reserved,
+  leaving safe headroom on the 80 GB H100
+- benchmark examples are processed longest-first; shortest-first processing
+  accumulated incompatible CUDA workspace blocks and reached `73.4 GiB`, while
+  longest-first completed the same 16+16 boundary at `31.7 GiB` allocated /
+  `32.5 GiB` reserved
+- CUDA's allocator cache is cleared once between boundaries because sibling
+  batches grow from 2 to 13 rows; otherwise workspaces for every earlier batch
+  shape accumulate even though no GPU candidate state remains live
+
+#### Search A: author-scale retained beam
+
+Status: running on the rented H100 with sibling-candidate batching
+
+Use only `math_16.json` and `eq_16.json` for search:
+
+- width: `2` per budget
+- replay window: `12`
+- replay budget: `12`
+- retained candidates: at most `25`
+- exact validation: baseline plus the top 24 proxy candidates on the small probes
+
+This is the primary experiment. It preserves about the same number of live
+candidates as the author's width-24 beam while exploring local blocks up to the
+length of his strongest single block.
+
+A two-Math/two-EQ pilot through boundary 12 reached 25 retained candidates and
+169 children per mature boundary. It completed in `1125.4s`, peaked at about
+`436 MiB` of CPU activation cache, and projected the full proxy search at
+roughly 9-11 hours (`$20-25`) before sibling batching. The first full 16+16 run
+was stopped while cross-example batching was debugged. Its replacement keeps
+benchmark batch size 1 and batches sibling candidates. Output and logs are
+written incrementally to:
+
+```text
+/workspace/results/qwen35_27b_searchA_small16.json
+/workspace/logs/qwen35_27b_searchA_small16.log
+```
+
+#### Search B: optional capacity check
+
+Run only if Search A completes comfortably and proxy/exact shortlist quality is
+not saturated:
+
+- first option: width `4`, window `12`, budget `12` (up to 49 retained)
+- second option: width `2`, window `12`, budget `24` (up to 49 retained)
+
+Do not run both automatically. Choose width 4 if useful candidates are being
+pruned within budget cells; choose budget 24 if the best candidates are hitting
+the 12-layer cap.
+
+#### Large-probe validation
+
+Freeze the architecture shortlist before looking at large-probe scores. Fully
+generate and score the baseline and shortlisted candidates on Math120 and all
+139 EQ examples. Report absolute scores, deltas, extra-layer count, and a Pareto
+frontier over quality versus added compute. The large probes are validation,
+not inputs to the activation-cached search.
+
+### Cost envelope
+
+Vast.ai currently advertises H100 SXM around `$2/hour`, but marketplace prices,
+storage, and bandwidth vary by host. Reserve:
+
+- `$5-10` for compatibility and profiling
+- `$20-40` for Search A
+- `$20-50` for large-probe exact validation
+- another `$20-40` only if Search B is justified
+
+A practical initial balance is `$75`; do not fund a multi-day run until Gate 1
+and Gate 2 provide measured throughput.
+
+## 13. CPU Activation-Cache Profile
 
 Status: implemented and validated
 
@@ -629,14 +887,20 @@ Validation:
 - all 120 Math plus 139 EQ examples completed a two-boundary cache restore smoke
 - large-dataset peak cache matched the estimate at `225.3 MiB` for beam width 2
 
-## 12. Immediate Next Tasks
+## 14. Immediate Next Tasks
 
 In order:
 
-1. Confirm the selected budget-indexed configuration on a held-out test split not used for tuning.
-2. Profile CUDA batch size and the cached implementation on the intended GPU/model combination.
+1. Check that a 13-sibling suffix batch fits safely on the 80 GB H100.
+2. Restart Search A and let its small-probe exact validation complete.
+3. Inspect proxy/exact ranking and replay-budget saturation.
+4. Add validation-only execution so the selected shortlist can be scored on
+   Math120/EQ140 without rerunning proxy search.
+5. Run staged large-probe validation, starting with baseline plus the best few
+   small-probe candidates before expanding the shortlist.
+6. Run Search B only if Search A shows a clear width or budget bottleneck.
 
-## 13. Commands We Can Reuse
+## 15. Commands We Can Reuse
 
 ### Sync environment
 
@@ -696,7 +960,104 @@ HF_HOME=.hf-cache .venv/bin/python scripts/beam_search.py \
   --output results/mac_smoke/suffix_beam_search_validation_4_full_generation.json
 ```
 
-## 14. Branches
+### Provision Vast.ai from the Mac
+
+Install the CLI and authenticate it locally. Keep the API key in the CLI config;
+never paste it into the repository or chat.
+
+```bash
+python3 -m pip install --user vastai
+vastai set api-key YOUR_API_KEY
+vastai show user
+```
+
+Create a dedicated SSH key and register only its public half:
+
+```bash
+ssh-keygen -t ed25519 -f ~/.ssh/vast_rys -C vast-rys
+vastai create ssh-key ~/.ssh/vast_rys.pub
+```
+
+Search for the recommended machine. Prices are live marketplace values, so
+inspect `dph`, storage, and bandwidth columns before choosing an offer ID.
+
+```bash
+vastai search offers \
+  'gpu_name=H100_SXM num_gpus=1 gpu_ram>=80 cpu_ram>=128 cpu_cores_effective>=16 disk_space>=200 inet_down>=500 reliability>=0.98 verified=true direct_port_count>=1 rentable=true cuda_vers>=12.8' \
+  -o 'dph'
+```
+
+Create the instance:
+
+```bash
+vastai create instance OFFER_ID \
+  --image pytorch/pytorch:2.11.0-cuda12.8-cudnn9-devel \
+  --disk 200 \
+  --ssh \
+  --direct \
+  --label rys-qwen35
+vastai show instances
+```
+
+The Vast instance page supplies a command shaped like:
+
+```bash
+ssh -i ~/.ssh/vast_rys -p PORT root@PUBLIC_IP
+```
+
+Optionally add it to `~/.ssh/config` as `Host vast-rys`. Set
+`ServerAliveInterval 30` and `ServerAliveCountMax 6` so idle sessions survive
+short network interruptions.
+
+Transfer the current working tree without local virtual environments, model
+caches, or old results:
+
+```bash
+rsync -az --delete \
+  --exclude .venv \
+  --exclude .hf-cache \
+  --exclude .uv-cache \
+  --exclude results \
+  -e 'ssh -i ~/.ssh/vast_rys -p PORT' \
+  ./ root@PUBLIC_IP:/workspace/RYS/
+```
+
+The `--delete` flag is safe only for the dedicated `/workspace/RYS/` directory.
+Omit it if that directory contains remote-only work.
+
+### Initialize the remote environment
+
+Run on the rented instance:
+
+```bash
+apt-get update
+apt-get install -y curl git rsync tmux
+curl -LsSf https://astral.sh/uv/install.sh | sh
+source "$HOME/.local/bin/env"
+
+mkdir -p /workspace/.cache/huggingface /workspace/.cache/uv /workspace/results
+export HF_HOME=/workspace/.cache/huggingface
+export UV_CACHE_DIR=/workspace/.cache/uv
+
+cd /workspace/RYS
+uv sync --python 3.11 --group dev
+uv run hf download Qwen/Qwen3.5-27B-FP8
+uv run python -m pytest -q
+nvidia-smi
+free -h
+```
+
+Use `tmux new -s rys` for paid runs. Open a second SSH session for
+`watch -n 1 nvidia-smi`; also monitor `free -h` because candidate activations
+are deliberately stored in system RAM.
+
+To let Codex operate the machine directly, add the local public key to Vast.ai
+and provide only the generated SSH command (`host` and `port`). The private key
+stays on this Mac. Codex can then invoke `ssh`, run experiments, poll logs, and
+copy results back through the terminal. Do not provide the Vast API key unless
+you explicitly want automated instance creation/destruction.
+
+## 16. Branches
 
 - `main`: baseline public repo behavior
 - `codex_proxy_search`: proxy scoring and suffix-search implementation

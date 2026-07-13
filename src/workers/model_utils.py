@@ -453,7 +453,15 @@ class LlamaLikePartialRunner:
             "position_ids": position_ids,
         }
         full_mask = create_causal_mask(**mask_kwargs)
-        if getattr(self.decoder, "has_sliding_layers", False):
+        if hasattr(self.decoder, "_update_linear_attn_mask"):
+            attention_masks: Any = {
+                "full_attention": full_mask,
+                "linear_attention": self.decoder._update_linear_attn_mask(
+                    attention_mask,
+                    cache_position,
+                ),
+            }
+        elif getattr(self.decoder, "has_sliding_layers", False):
             attention_masks: Any = {
                 "full_attention": full_mask,
                 "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
@@ -488,7 +496,9 @@ class LlamaLikePartialRunner:
             layer = self.layers[idx]
             attention_mask = state.attention_masks
             if isinstance(attention_mask, dict):
-                attention_type = getattr(layer, "attention_type", "full_attention")
+                attention_type = getattr(layer, "attention_type", None)
+                if attention_type is None:
+                    attention_type = getattr(layer, "layer_type", "full_attention")
                 if attention_type not in attention_mask:
                     raise ValueError(f"No prepared attention mask for type {attention_type!r}.")
                 attention_mask = attention_mask[attention_type]
@@ -510,6 +520,52 @@ class LlamaLikePartialRunner:
             position_ids=state.position_ids,
             cache_position=state.cache_position,
             position_embeddings=state.position_embeddings,
+        )
+
+    def stack_states(
+        self,
+        states: list[PartialForwardState],
+    ) -> PartialForwardState:
+        """Stack sibling states while repeating their shared sequence metadata."""
+        if not states:
+            raise ValueError("Cannot stack an empty state list.")
+
+        reference = states[0]
+        batch_size = reference.hidden_states.shape[0]
+        for state in states[1:]:
+            if state.hidden_states.shape != reference.hidden_states.shape:
+                raise ValueError("Sibling hidden states must have identical shapes.")
+            if (
+                state.attention_masks is not reference.attention_masks
+                or state.position_ids is not reference.position_ids
+                or state.cache_position is not reference.cache_position
+                or state.position_embeddings is not reference.position_embeddings
+            ):
+                raise ValueError("Sibling states must share the same sequence metadata.")
+
+        copies = len(states)
+
+        def repeat_batch(value: Any) -> Any:
+            if isinstance(value, torch.Tensor):
+                if value.ndim > 0 and value.shape[0] == batch_size:
+                    repeats = (copies,) + (1,) * (value.ndim - 1)
+                    return value.repeat(repeats)
+                return value
+            if isinstance(value, dict):
+                return {key: repeat_batch(item) for key, item in value.items()}
+            if isinstance(value, tuple):
+                return tuple(repeat_batch(item) for item in value)
+            return value
+
+        return PartialForwardState(
+            hidden_states=torch.cat(
+                [state.hidden_states for state in states],
+                dim=0,
+            ),
+            attention_masks=repeat_batch(reference.attention_masks),
+            position_ids=repeat_batch(reference.position_ids),
+            cache_position=reference.cache_position,
+            position_embeddings=repeat_batch(reference.position_embeddings),
         )
 
     def run_range(
