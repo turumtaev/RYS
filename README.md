@@ -16,6 +16,19 @@ this branch. The longer chronological design log is in
 
 ## Method
 
+The method starts from one observation:
+
+> If the remaining model layers are fixed, benchmark quality depends on the
+> hidden-state representation handed to those layers.
+
+Here, **prefix** and **suffix** refer to parts of the model's layer execution
+path, not to token prefixes or suffixes.
+
+At boundary `k`, all candidate expansions are evaluated through the same model
+suffix, layers `k+1 .. N-1`. The search can therefore compare the hidden states
+produced by different local layer paths, retain the representations that score
+best on the benchmark, and reuse the cached prefix states that produced them.
+
 Let the original decoder contain layers `0 .. N-1`. At boundary `k`, every beam
 candidate represents an execution path through layer `k-1` and owns the hidden
 states produced by that prefix for every benchmark example. The search expands
