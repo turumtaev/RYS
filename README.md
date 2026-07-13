@@ -1,7 +1,7 @@
 # Benchmark-Conditioned Suffix Beam Search for RYS
 
-This fork experiments with a more incremental way to search for useful layer
-repetitions in decoder language models. It builds on Daniel Han-Chen's
+This fork explores benchmark-conditioned suffix beam search for finding useful
+layer repetitions in decoder language models. It builds on Daniel Han-Chen's
 [RYS repository](https://github.com/dnhkng/RYS) and the experiments described in
 [RYS Part II](https://dnhkng.github.io/posts/rys-ii/).
 
@@ -9,8 +9,6 @@ The upstream project searches for a fixed relayered architecture by evaluating
 complete repeated blocks and composing the strongest blocks with beam search.
 This fork searches for the same kind of static architecture, but grows it one
 model boundary at a time and reuses benchmark hidden states across expansions.
-It is not token-level beam search and it does not change the architecture during
-normal inference.
 
 The implementation, tests, GPU launchers, and corrected evaluation code are on
 this branch. The longer chronological design log is in
@@ -133,15 +131,25 @@ RYS Part II reports this Pareto frontier for Qwen3.5-27B:
 | `(30,35)` | 5 (7.81%) | +0.0279 | +0.0979 | +0.1257 |
 | `(26,34)` | 8 (12.50%) | +0.0279 | +0.1009 | +0.1288 |
 
-Those published EQ values were calculated against `reference_answer`, whose
-four scores are normalized together. The prompt asks the model for four
-independent scores on a 0-10 scale, and the datasets also contain the intended
-integer labels under `reference_answer_fullscale`. This fork changes exact EQ
-evaluation to use the full-scale references.
+During reproduction, we found a bug in the upstream EQ evaluator. Generated
+scores are on the 0-10 scale requested by the prompt, but the evaluator compared
+them with `reference_answer`, where the four reference scores are normalized
+together. The datasets contain the intended integer labels under
+`reference_answer_fullscale`. This fork changes exact EQ evaluation to use that
+field.
 
-Because the target changed, the published deltas above cannot be compared
-directly with the corrected results below. We reran the baseline, all four
-author configs, and our candidates through one common corrected evaluator.
+The bug affects more than the reported EQ deltas. Because EQ score was part of
+the search objective, it may also have affected which candidates were selected
+for the reported Pareto frontier. Correcting the reference field does not
+retroactively correct the original search; that would require reevaluating its
+full candidate set and rerunning selection.
+
+The table below is therefore a new common-evaluator rerun, not a corrected
+version of the published table. It evaluates the baseline, the four
+configurations reported in RYS II, and our candidates with the same corrected
+EQ code. The RYS II configurations were selected under the original metric, so
+the comparison should not be treated as a symmetric test of the two search
+methods.
 
 ### Corrected common-evaluator comparison
 
@@ -152,29 +160,28 @@ same run.
 | Source | Config | Extra | Math | EQ | Average | Math delta | EQ delta |
 |---|---|---:|---:|---:|---:|---:|---:|
 | Baseline | none | 0 | 0.969651 | 0.647302 | 0.808476 | 0 | 0 |
-| RYS II | `(33,34)` | 1 | 0.989684 | 0.668975 | 0.829329 | +0.020033 | +0.021673 |
-| RYS II | `(31,34)` | 3 | 0.998575 | 0.670234 | 0.834405 | +0.028925 | +0.022932 |
-| RYS II | `(30,35)` | 5 | 0.995503 | 0.672482 | 0.833992 | +0.025852 | +0.025180 |
-| RYS II | `(26,34)` | 8 | 0.997037 | 0.672302 | 0.834669 | +0.027386 | +0.025000 |
+| RYS II config, rerun | `(33,34)` | 1 | 0.989684 | 0.668975 | 0.829329 | +0.020033 | +0.021673 |
+| RYS II config, rerun | `(31,34)` | 3 | 0.998575 | 0.670234 | 0.834405 | +0.028925 | +0.022932 |
+| RYS II config, rerun | `(30,35)` | 5 | 0.995503 | 0.672482 | 0.833992 | +0.025852 | +0.025180 |
+| RYS II config, rerun | `(26,34)` | 8 | 0.997037 | 0.672302 | 0.834669 | +0.027386 | +0.025000 |
 | This search, `beam_23` | `(43,44)` | 1 | **0.998712** | **0.669784** | **0.834248** | **+0.029061** | **+0.022482** |
 | This search, `beam_20` | `(43,44);(45,46);(47,48)` | 3 | 0.994119 | **0.676349** | **0.835234** | +0.024468 | **+0.029047** |
 
 The bold values compare configurations with the same number of extra layers.
-Under this corrected evaluator:
+Within this corrected rerun:
 
-- `beam_23` dominates the author's one-layer `(33,34)` config and improves
-  average score by `0.004919` at the same 1.56% overhead.
-- `beam_20` dominates the author's three-layer `(31,34)` config and improves
-  average score by `0.000829` at the same 4.69% overhead.
-- `beam_20` has the highest average among all 29 evaluated configs. It exceeds
-  the author's best corrected average, `(26,34)`, by `0.000564` while using
-  three rather than eight extra layers.
-- The corrected Pareto frontier over extra layers and average score is the
-  baseline, `beam_23`, and `beam_20`; none of the four author configs remains
-  on that frontier.
+- `beam_23` scores `0.004919` higher on average than the one-layer `(33,34)`
+  config at the same 1.56% overhead.
+- `beam_20` scores `0.000829` higher on average than the three-layer `(31,34)`
+  config at the same 4.69% overhead.
+- `beam_20` has the highest average among the 29 configurations evaluated in
+  this run. Its average is `0.000564` above the eight-layer `(26,34)` config
+  while using three extra layers.
+- For this limited candidate set, the Pareto frontier over extra layers and
+  average score consists of the baseline, `beam_23`, and `beam_20`.
 
-This is a fair comparison among the configs in this rerun, but it is not an
-exact reproduction of the blog's absolute numbers. The blog used ExLlamaV3;
+All configurations in this table were evaluated consistently, but this is not
+an exact reproduction of the blog's absolute numbers. The blog used ExLlamaV3;
 this experiment used Hugging Face Transformers with BF16 computation over the
 FP8 checkpoint. Backend-level numerical differences can alter greedy outputs.
 The Math metric also awards partial credit, so a near-1 Math score is not the
@@ -303,3 +310,26 @@ can replace the current boundary-by-boundary algorithm.
 For the original single-block scanner, multi-block beam search, surrogate
 pipeline, exporter, and upstream usage instructions, see
 [dnhkng/RYS](https://github.com/dnhkng/RYS).
+
+## Citing This Work
+
+If you use this implementation or its experimental results, please cite both
+the original RYS II work and this repository:
+
+```bibtex
+@article{ng2026rysii,
+  title  = {LLM Neuroanatomy II: Modern LLM Hacking and hints of a Universal Language?},
+  author = {Ng, David Noel},
+  year   = {2026},
+  month  = {March},
+  url    = {https://dnhkng.github.io/posts/rys-ii/}
+}
+
+@software{turumtaev2026suffixbeam,
+  title  = {Benchmark-Conditioned Suffix Beam Search for RYS},
+  author = {Turumtaev, Galim},
+  year   = {2026},
+  month  = {July},
+  url    = {https://github.com/turumtaev/RYS}
+}
+```
