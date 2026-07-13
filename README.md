@@ -318,7 +318,9 @@ can replace the current boundary-by-boundary algorithm.
 - `src/workers/math_worker.py`: Math prompts, proxy targets, generation, scoring.
 - `src/workers/eq_worker.py`: EQ prompts, numeric masks, generation, scoring.
 - `tests/test_surrogate_utils.py`: suffix-search and scoring tests.
-- `SUFFIX_BEAM_SEARCH.md`: historical design decisions and experiment log.
+- `SUFFIX_BEAM_SEARCH.md`: Codex-oriented internal engineering log with design
+  decisions, intermediate experiments, failures, and next-step notes; the
+  README is the human-facing summary.
 
 For the original single-block scanner, multi-block beam search, surrogate
 pipeline, exporter, and upstream usage instructions, see

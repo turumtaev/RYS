@@ -1,16 +1,33 @@
 # Benchmark-Conditioned Suffix Beam Search
 
-This file is the canonical plan for this branch.
+This file is the internal engineering log used while developing the feature
+with Codex. It preserves design decisions, intermediate measurements, failed
+experiments, and commands. It is intentionally chronological and repetitive;
+[`README.md`](README.md) is the concise human-facing description.
 
-It has two jobs:
+It has three jobs:
 
 1. preserve the **original target algorithm**
-2. record the **current implementation stage**
+2. record the implementation history and experiment evidence
+3. keep the current limitations and next engineering steps explicit
 
-The most important correction is:
+Current status, updated 2026-07-14:
 
-> the current branch does **not** yet implement the full suffix beam search algorithm.
-> It implements the teacher-forced proxy scoring infrastructure that we plan to use inside that algorithm.
+- the boundary-cached, budget-indexed suffix beam search is implemented
+- an end-to-end `Qwen/Qwen3.5-27B-FP8` search completed on an 80 GB H100
+- the selected candidates and four RYS II Pareto configurations were evaluated
+  on all 120 Math and 139 EQ examples with corrected full-scale EQ references
+- the final results are summarized in `README.md`
+- remaining work is optimization and search-space expansion, not initial
+  implementation
+
+> **Historical EQ metric warning:** local exact EQ and combined-score results
+> recorded below before the Qwen3.5 GPU comparison used the upstream
+> `reference_answer` field. That field normalizes the four EQ labels together,
+> while the prompt and generated answers use independent 0-10 scores. Those
+> historical exact EQ and combined numbers are preserved as debugging evidence
+> and were not rerun. Proxy scores and Math scores are unaffected. The final
+> 120+139 comparison uses `reference_answer_fullscale`.
 
 ## 1. Original Target
 
@@ -105,7 +122,11 @@ All of them are scored on the benchmark, and we keep the top `C`.
 
 The useful observation is:
 
-> if the suffix is fixed, benchmark quality depends on the representation handed to that suffix.
+> if the remaining model layers are fixed, benchmark quality depends on the
+> hidden-state representation handed to those layers.
+
+Here, prefix and suffix mean sections of the model's layer execution path, not
+token prefixes or suffixes.
 
 That makes an incremental search possible.
 
@@ -157,6 +178,9 @@ complete answer rather than to the correct numeric prefix followed by more digit
 
 Qwen2.5-0.5B validation after adding terminators:
 
+> The exact combined values in this subsection are covered by the historical
+> EQ metric warning at the top of this file.
+
 - Math target scores every answer token plus `<|im_end|>`
 - EQ scores each numeric token plus newline, with `<|im_end|>` after the final score
 - uncapped two-example baseline exact combined score: `0.462018`
@@ -172,7 +196,8 @@ This proxy is already implemented in this branch.
 
 ## 7. What The Current Branch Actually Implements
 
-This branch implements the first correctness-first version of the suffix search.
+This branch implements the first correctness-first end-to-end version of the
+suffix search.
 
 ### Implemented
 
@@ -188,13 +213,23 @@ This branch implements the first correctness-first version of the suffix search.
 - exact generation-based shortlist validation
 - held-out validation dataset selection
 - budget-indexed beams with independent pruning per replay-layer budget
+- Qwen3.5 partial-layer execution, hybrid attention, and cache-position support
+- corrected `reference_answer_fullscale` EQ evaluation in Hugging Face and
+  ExLlama workers
+- explicit exact evaluation of arbitrary baseline, author, and search configs
+- reproducible Qwen3.5-27B GPU launchers
 - Mac-compatible local environment
 - small local smoke validation
+- complete 64-boundary Qwen3.5-27B GPU search
+- full 120 Math + 139 EQ corrected comparison
 
 ### Not implemented yet
 
-- budget-indexed hyperparameter tuning
-- intended large-model GPU validation
+- reliable variable-length cross-example batching for Qwen3.5
+- production-safe sibling-candidate batching
+- nested replays that can modify the pending suffix of an earlier replay
+- a corrected rerun of the author's full search candidate set
+- broad Qwen3.5-27B hyperparameter tuning
 
 The cached budget-indexed search now runs end to end and preserves candidates
 that spend their replay budget at later boundaries.
@@ -203,20 +238,20 @@ that spend their replay budget at later boundaries.
 
 We are in:
 
-- `Search-quality refinement: budget-indexed tuning`
+- `Post-experiment analysis and next search-space design`
 
 Status:
 
-- proxy scoring is implemented
-- Mac environment is working
-- focused tests are passing
-- real Math and EQ smoke runs are passing
-- MPS is available in normal, unsandboxed execution
-- partial and repeated layer paths match Hugging Face full-model execution
-- the cached suffix-search driver is implemented
-- exact shortlist and held-out validation are implemented
-- a full 30-boundary tiny-model MPS smoke search completed successfully
-- a full 24-boundary Qwen search completed on both 16-example smoke subsets
+- all planned correctness-first search components are implemented
+- Mac CPU/MPS smoke and equivalence tests pass
+- the Qwen3.5-27B H100 search and exact large-set comparison are complete
+- `beam_23`, replay `(43,44)`, is the selected one-extra-layer result
+- `beam_20`, replays `(43,44);(45,46);(47,48)`, is the selected
+  three-extra-layer result and has the highest corrected average among the 29
+  configurations evaluated in the comparison
+- cross-example proxy batching remains disabled for Qwen3.5
+- sibling batching is preserved only on `codex/sibling-batching-wip`
+- nested replay paths remain unsupported
 
 ## 9. Completed Work
 
@@ -280,20 +315,57 @@ Impact:
 - normal terminal runs can use `--device-map mps`
 - Codex-run MPS experiments require elevated execution so Metal is visible
 
-### Search algorithm still missing
+### Qwen3.5 cross-example batching
 
-We have proved:
+The final GPU search used benchmark batch size 1. Batch size 2 initially
+produced `NaN` EQ proxy scores. Fixing a cached-padding materialization bug
+removed that NaN source, but variable-length batch scores still differed from
+batch-1 scores at boundary 0. Almost every EQ example has a different length,
+so ordinary length sorting does not produce useful equal-length groups.
 
-- environment works
-- proxy worker path works
+Until packed-sequence or another padding-independent path is validated,
+Qwen3.5 defaults to batch size 1 for correctness.
 
-We have not yet proved:
+### Upstream EQ reference bug
 
-- suffix beam search orchestration works
-- proxy ranking is useful enough inside that search
-- cache reuse gives real speedup
+This fork's Hugging Face and ExLlama exact evaluators now use
+`reference_answer_fullscale`. The original upstream repository still needs the
+isolated fix and regression test. Historical search rankings cannot be repaired
+from the published Pareto table alone because the incorrect EQ score was part
+of candidate selection.
 
-## 11. Planned Stages
+### Sibling-candidate batching
+
+Children of one parent can be batched after their local replays because they
+have equal sequence length and execute the same remaining layer suffix. That
+implementation is preserved at commit `92e3567` on branch
+`codex/sibling-batching-wip`.
+
+It was not used for the final search. With replay window 12, sibling batch size
+grows to 13, and the longest EQ sequence made the 80 GB peak-memory risk too
+high for the rented run. Its small BF16/FP8 score differences also need ranking
+stability validation.
+
+### Nested replay paths
+
+The current candidate stores a flattened completed prefix. It can represent
+`1,2,3,1,2,3`, but cannot insert another replay inside that replay to construct
+`1,2,3,1,2,1,2,3`.
+
+The proposed generalization stores a completed prefix and pending suffix for
+every candidate. If, at boundary `k`, replaying `k-2,k-1,k` before the old
+suffix is selected, retain:
+
+```text
+prefix = old_prefix + [k]
+suffix = [k-2, k-1, k] + old_suffix
+```
+
+Candidates should then be scheduled by the smallest unfinished layer boundary.
+This requires new deduplication, replay-budget, cache-lifetime, and pruning
+rules.
+
+## 11. Implementation and Experiment Stages
 
 ### Stage A. Proxy implementation
 
@@ -316,15 +388,17 @@ Status: done
 
 Status: done
 
-Suggested core module:
+Actual implementation:
 
-- `src/core/benchmark_suffix_scorer.py`
+- `LlamaLikePartialRunner` and model-stack adapters in
+  `src/workers/model_utils.py`
 
-First supported architecture family:
+Supported architecture family:
 
-- Llama/Qwen-style decoder models exposing `model.layers`
+- Llama/Qwen-style decoder models with discoverable stacks such as
+  `model.layers` and `model.language_model.layers`
 
-Needed capabilities:
+Implemented capabilities:
 
 - prepare embeddings, masks, positions, and RoPE inputs
 - run an arbitrary contiguous layer range
@@ -345,7 +419,8 @@ also matches exactly on MPS for both normal and repeated paths.
 Status: done
 
 The branch version of `scripts/beam_search.py` now implements the new algorithm.
-The baseline branch retains the author's original search.
+The original search remains available in the upstream
+[`dnhkng/RYS`](https://github.com/dnhkng/RYS) repository.
 
 Responsibilities:
 
@@ -387,7 +462,8 @@ too few to judge whether the selected replay configuration generalizes.
 
 ### Stage F. Correlation / shortlist validation
 
-Status: local held-out validation passed with a strict replay budget
+Status: historical local experiment complete; exact EQ/combined values were
+later found to use the wrong reference scale
 
 Goal:
 
@@ -399,6 +475,10 @@ Purpose:
 - test whether proxy ranking is useful enough
 
 Initial four-example result with the tiny model:
+
+> Historical metric note: the proxy and Math values below remain useful, but
+> the exact EQ and combined values predate the full-scale EQ reference fix.
+> They must not be compared with the corrected Qwen3.5 results.
 
 - baseline proxy: `-2.846952`
 - best beam proxy: `-2.340805`
@@ -412,12 +492,12 @@ Initial four-example result with the tiny model:
 The proxy-selected architecture improved exact EQ but substantially harmed
 exact Math generation. Its Math outputs collapsed to a repeated large integer.
 The mismatch remains with the workers' full generation limits, so it is not a
-truncation artifact. This means the current teacher-forced combined objective
-is not yet reliable enough to justify cache optimization or GPU-scale search.
+truncation artifact. At the time, this established that proxy ranking alone was
+not sufficient and motivated answer-termination scoring, replay-budget caps,
+and exact shortlist validation.
 
-However, this is still a tiny-model result. The 135M baseline is itself poor at
-the benchmark, so the next correlation test should use a locally runnable model
-that can produce valid Math and EQ answers before changing the proxy design.
+This was a tiny-model debugging result. The 135M baseline was itself poor at the
+benchmark, so the next historical step used a stronger locally runnable model.
 
 Follow-up with `Qwen/Qwen2.5-0.5B-Instruct`:
 
@@ -432,22 +512,48 @@ Follow-up with `Qwen/Qwen2.5-0.5B-Instruct`:
 - proxy order: `beam_1, beam_2, baseline`
 - held-out exact order: `beam_1, beam_2, baseline`
 
-Conclusion: the teacher-forced objective is useful for shortlist construction
-when architecture growth is constrained, but large replay budgets cause the
-greedy beam to over-relayer and collapse generation. Exact shortlist validation
-remains required. The safe local default is therefore two extra layers; larger
-budgets should be tested as an explicit sweep rather than inherited from the
-author's different search algorithm.
+The conclusion at the time was that the teacher-forced objective was useful for
+shortlist construction when architecture growth was constrained, while large
+replay budgets could collapse generation. Exact shortlist validation is still
+required, but the exact combined rankings in this local experiment are not
+current benchmark evidence because of the EQ reference bug.
 
 ### Stage G. GPU experiments
 
-Status: pending
+Status: complete for the first Qwen3.5-27B experiment
 
-Only start after:
+Search setup:
 
-1. Math and EQ local smoke tests pass
-2. suffix-search smoke test runs end to end
-3. proxy ranking looks directionally useful
+- model: `Qwen/Qwen3.5-27B-FP8`
+- hardware: one 80 GB H100
+- proxy set: 16 Math + 16 EQ examples
+- beam width: 2 per exact replay budget
+- replay window: 12
+- maximum extra layers: 12
+- benchmark batch size: 1
+- completed boundaries: all 64 layers
+- search time: `36,958s` (`10.27h`)
+- peak CUDA allocated/reserved: `29.9 / 42.5 GiB`
+- peak CPU boundary cache: `3.54 GiB`
+
+Exact comparison setup:
+
+- 120 Math + 139 EQ examples
+- corrected EQ field: `reference_answer_fullscale`
+- baseline + four RYS II Pareto configs + 24 search candidates
+- common Hugging Face/Transformers evaluator, batch size 1
+
+Selected corrected results:
+
+| Label | Replays | Extra | Math | EQ | Average |
+|---|---|---:|---:|---:|---:|
+| baseline | none | 0 | `0.969651` | `0.647302` | `0.808476` |
+| `beam_23` | `(43,44)` | 1 | `0.998712` | `0.669784` | `0.834248` |
+| `beam_20` | `(43,44);(45,46);(47,48)` | 3 | `0.994119` | `0.676349` | `0.835234` |
+
+The full interpretation and comparison caveats are in `README.md`. In
+particular, the author's reported configs were selected with the old EQ metric,
+so this corrected rerun is not a symmetric comparison of search methods.
 
 ### Benchmark chunking
 
@@ -460,7 +566,7 @@ Status: done
 
 ### Padding-aware proxy batching
 
-Status: implemented; CUDA profiling pending
+Status: infrastructure implemented; disabled for Qwen3.5 after CUDA profiling
 
 - examples are right-padded within each batch
 - examples are sorted by tokenized length within each benchmark before batching
@@ -480,12 +586,16 @@ Qwen MPS probe with four Math and four EQ examples:
 - maximum score difference was `1.22e-4` in float16
 
 Batching did not help this MPS workload because EQ padding and large vocabulary
-logits outweighed launch savings. The automatic default is therefore batch 1
-for CPU/MPS and batch 8 for CUDA. CUDA batch size still needs profiling.
+logits outweighed launch savings. CUDA profiling on Qwen3.5-27B later found
+`NaN` EQ scores at batch size 2. A padding-cache fix removed the NaNs but did
+not restore score equivalence with batch size 1. The automatic default is now
+batch 1 for CPU/MPS and Qwen3.5; other CUDA architectures may use larger
+batches after validation.
 
 ### Global-beam hyperparameter baseline
 
-Status: small local tuning pass complete
+Status: historical local tuning pass complete; combined scores use the old EQ
+reference scale
 
 Setup:
 
@@ -503,15 +613,14 @@ Results:
 | 4 | 2 | 2 | `86.6s` | `0.509368` |
 | 2 | 2 | 4 | `74.6s` | `0.490254` |
 
-The current global-beam baseline is therefore beam width `2`, replay window
-`1`, and replay budget `2`. Wider search improved proxy scores but not held-out
-exact quality. This is a deliberately small, noisy tuning pass; it selects a
-reasonable baseline for testing budget-indexed beams, not final production
-hyperparameters.
+This pass selected beam width `2`, replay window `1`, and replay budget `2` for
+the next local engineering comparison. It was a deliberately small, noisy pass
+and is preserved as implementation history, not as current production tuning.
 
 ### Budget-indexed beam comparison
 
-Status: implementation and first comparison complete
+Status: implementation complete; quality comparison is historical because the
+combined score uses the old EQ reference scale
 
 The search now keeps an independent beam for every exact replay-layer budget.
 At boundary `k`, budget `i` receives:
@@ -528,19 +637,19 @@ Using window `1` and maximum budget `2`:
 | Budget-indexed | 1 per budget | `89.3s` | `0.461896` |
 | Budget-indexed | 2 per budget | `135.9s` | **`0.547777`** |
 
-Budget-indexed width 2 found the later-layer configuration `(4,5);(11,12)`,
-which improved held-out Math enough to beat the global baseline. Its best exact
-candidate was second by proxy within budget 2, so exact shortlist validation
-remains necessary.
+Budget-indexed width 2 found the later-layer configuration `(4,5);(11,12)`.
+Its best exact candidate was second by proxy within budget 2, which motivated
+retaining more than the single proxy winner for exact validation.
 
-At approximately matched local runtime, global width 4 beat budget-indexed
-width 1. Budget indexing therefore improved maximum observed quality, not
-compute efficiency. Because it showed a quality gain, a small budget-indexed
-hyperparameter pass is justified next.
+At approximately matched local runtime, global width 4 scored above
+budget-indexed width 1 under the historical metric. The main durable result is
+that budget-indexed pruning worked and preserved later-budget candidates; the
+quality comparison itself should not be reused.
 
 ### Budget-indexed hyperparameter pass
 
-Status: small local tuning pass complete
+Status: historical local tuning pass complete; combined scores use the old EQ
+reference scale
 
 The pass kept width `2` per budget and varied one parameter at a time from the
 initial budget-indexed result:
@@ -557,11 +666,10 @@ held-out exact candidate replayed `(7,8);(11,12);(15,16)` and scored
 `0.605051`; it ranked fourth by proxy, which reinforces the need to validate a
 shortlist rather than only the proxy winner.
 
-The selected local configuration is therefore width `2` per budget, replay
-window `1`, and maximum replay budget `4`. This selection used the first four
-examples for proxy search and the next four for exact validation, so it must be
-confirmed on a fresh test split before treating the improvement as evidence of
-generalization.
+This pass selected width `2` per budget, replay window `1`, and maximum replay
+budget `4` for subsequent engineering work. It used only four proxy examples
+and four validation examples per benchmark and the pre-fix EQ evaluator, so it
+is not a current hyperparameter recommendation.
 
 ### CPU activation-cache profile
 
@@ -633,8 +741,17 @@ Validation:
 
 In order:
 
-1. Confirm the selected budget-indexed configuration on a held-out test split not used for tuning.
-2. Profile CUDA batch size and the cached implementation on the intended GPU/model combination.
+1. Submit the isolated upstream fix that changes exact EQ scoring from
+   `reference_answer` to `reference_answer_fullscale`, with a regression test.
+2. Specify and test the generalized candidate state needed for nested replays:
+   completed layer prefix, pending layer suffix, replay budget, and boundary
+   cache ownership.
+3. Only revisit Qwen3.5 batching if more GPU search is planned: packed-sequence
+   cross-example batching first, then sibling batching with explicit OOM and
+   ranking-stability tests.
+4. For a symmetric comparison with RYS II, rerun the author's complete search
+   candidate set or rerun the search itself under the corrected EQ objective
+   and, ideally, the original ExLlamaV3 backend.
 
 ## 13. Commands We Can Reuse
 
@@ -696,7 +813,17 @@ HF_HOME=.hf-cache .venv/bin/python scripts/beam_search.py \
   --output results/mac_smoke/suffix_beam_search_validation_4_full_generation.json
 ```
 
+### Recorded Qwen3.5-27B GPU experiment
+
+```bash
+./scripts/run_qwen35_search_a.sh
+./scripts/run_qwen35_large_comparison.sh
+```
+
 ## 14. Branches
 
-- `main`: baseline public repo behavior
-- `codex_proxy_search`: proxy scoring and suffix-search implementation
+- `main`: published suffix-search implementation and corrected evaluator
+- `suffix-beam-search`: same published implementation history as `main`
+- `codex/sibling-batching-wip`: experimental sibling batching at commit
+  `92e3567`; not used for the final GPU search
+- [`dnhkng/RYS`](https://github.com/dnhkng/RYS): original upstream behavior
